@@ -8,6 +8,25 @@ The model is taught the 17 SemanticKITTI classes in five stages and never sees t
 Forgetting is reduced with teacher pseudo-labels and a small replay buffer, and the new classes are learned from 3D ground
 truth, from projected 2D ground truth, or from open-vocabulary [SAM 3](https://github.com/facebookresearch/sam3) masks.
 
+### Key results
+
+SemanticKITTI validation sequence 08, 5-step split, final step (all 17 classes):
+
+- **Forgetting is the main problem.** mIoU falls from 0.2526 after step 0 to 0.0892 after step 4 with pseudo-label distillation alone.
+  The four classes introduced last (bicycle, motorcycle, bicyclist, motorcyclist) stay below 0.02 IoU in every recipe.
+- **A 49-frame replay buffer helps at every step.** With 3D labels it raises Old mIoU by 4.2 / 4.9 / 5.1 / 9.5 % (relative) at steps 1-4,
+  and the final-step mIoU from 0.0892 to 0.0980. A random buffer of the same size is almost as good (0.0977).
+- **3D labels beat 2D-only supervision for the new classes.** 2D ground truth and SAM 3 masks trail 3D ground truth with replay by about
+  0.014-0.017 mIoU from step 2 on, and SAM 3 comes within about 0.003 of 2D ground truth.
+
+**What "label-free" means here.** The new classes are learned from 3D labels, from 2D masks, or from SAM 3 text-prompted masks.
+The SAM 3 recipe needs no annotation for the new classes at all. The 2D-GT recipe is a proxy for cheap 2D annotation (its masks are
+projected from the 3D labels), and the 3D-GT recipe is the fully supervised reference, which also scores best.
+
+**Limits.** Each result is one run (one seed) on one validation sequence. There is no joint-training reference for the 5-step split
+(only for the 3-step split) and no comparison with published class-incremental methods. Checkpoints, masks, pseudo-labels and
+datasets are not included, so the numbers cannot be reproduced from this repository alone.
+
 ![5-step final step: what replay adds](./docs/results/5step_replay.png)
 
 ## What this repository contains
@@ -271,6 +290,11 @@ change them to match your layout. Run steps in order; each needs the previous st
   are edited by hand for each step and recipe, so the versions in `patches/` are one recipe's final-step settings (step 4,
   3D GT + random replay), not a default. Check `continual_step`, `pseudo.root`, `replay.*`, `render2d.*`, and `resume.ckpt_path` before every run.
 - Trained checkpoints of these experiments are not published, and neither are the masks, pseudo-labels or datasets.
+
+## License
+
+The original work in this repository is released under the [MIT License](./LICENSE). The upstream DISC code is not included
+and has its own (absent) license terms; see the note in `LICENSE`.
 
 ## 🌟 Acknowledgement
 
