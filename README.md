@@ -8,6 +8,8 @@ The model is taught the 17 SemanticKITTI classes in five stages and never sees t
 Forgetting is reduced with teacher pseudo-labels and a small replay buffer, and the new classes are learned from 3D ground
 truth, from projected 2D ground truth, or from open-vocabulary [SAM 3](https://github.com/facebookresearch/sam3) masks.
 
+**Slides:** [project presentation (PDF, 39 slides)](./docs/presentation.pdf), covering motivation, related work, method, results and conclusions.
+
 ### Key results
 
 SemanticKITTI validation sequence 08, 5-step split, final step (all 17 classes):
