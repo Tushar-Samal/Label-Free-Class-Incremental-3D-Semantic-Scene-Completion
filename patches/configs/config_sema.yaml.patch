@@ -1,0 +1,70 @@
+--- a/configs/config_sema.yaml
++++ b/configs/config_sema.yaml
+@@ -17,24 +17,57 @@
+   devices: 4
+   accelerator: gpu
+   accumulate_grad_batches: 1
+-  # strategy: ddp
+   strategy: ddp_find_unused_parameters_true
+-  sync_batchnorm: True
+-  # precision: 16-mixed
++  # strategy: auto
++  sync_batchnorm: False
+   enable_progress_bar: True
+-  max_epochs: 30
+-
++  max_epochs: 15
++  enable_checkpointing: True
++  log_every_n_steps: 50
++  precision: 32-true
++  # precision: 16-mixed
++  
++scheduler:
++  milestones: [13]  # matched to the same *update* count as the 25-epoch/1168-frame no-replay run (see comment in this file)
+ 
+ data:
+-  datasets: # base voxel_size=0.2 
++  datasets: # base voxel_size=0.2
+     project_scale: 2  # default project_scale=2, using smaller scale to save memory 
+   loader:
+     batch_size: 1
+ 
++# 5-step DCIL (2026-09-29) -- 3D GT + RANDOM REPLAY RECIPE (2026-10-09, new experiment track):
++# step 4. Same recipe as the class-aware 3D-GT replay chain (new classes get real 3D GT on the
++# step's own frames; old classes on regular frames via pseudo-labels from the previous step's teacher;
++# render2d off), but the replay buffer is drawn with the RANDOM strategy: a uniform per-sequence
++# sample of every earlier sequence (seed 42), with images_per_seq_pct tuned per step so the total is
++# ~49 frames, i.e. the same budget as the class-aware buffer. step0 was always 3D GT -> replay frames
++# get real 3D GT.
++pseudo:
++  enable: True
++  mode: offline
++  tau: 0.8
++  lambda_old: 1
++  root: datasets/Fixed/5-step/pseudo_labels/step4_from_step3_3DGT_random
++
++render2d:
++  enable: False
++  sam3_only_new_classes: False
++  lambda_render2d: 1.0
++  new_class_ids: []
++  new_global_weight: 1.0   # CE weight for CIL-new classes (self.new_global) vs 1.0 for old classes, within render2d supervision
++  replay_via_render_steps: []
++  pc_range: [0.0, -25.6, -2.0, 51.2, 25.6, 4.4]
++  mask_root:  datasets/Fixed/5-step/SAM3/merged
++  ignore_index: 255
++
++teacher:
++  ckpt_path: null
++  # ckpt_path: outputs/DISC/DISC-v1-sema/step1_3DGT_noreplay_25ep.ckpt
+ 
+ save:
+   logger_dir_name: DISC
+-  logger_version_name:  DISC-v1-sema # default version_1,...version_n
++  logger_version_name:  DISC-v1-sema
+ 
+ resume:
+-  ckpt_path: None
+\ No newline at end of file
++  ckpt_path: "outputs/DISC/DISC-v1-sema/Fixed/5-step/3D_GT/Random_Replay/step3_5step_3DGT_random.ckpt"   # step3 3D-GT random-replay best (val/mIoU) checkpoint
+\ No newline at end of file

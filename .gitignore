@@ -1,0 +1,34 @@
+# checkpoints, weights, arrays
+*.ckpt
+*.pth
+*.pt
+*.onnx
+*.npy
+*.npz
+
+# datasets, outputs, logs
+/datasets/
+/pretrain/
+/outputs/
+/eval_outputs/
+eval_outputs_*/
+/Logs/
+*.log
+*.out
+
+# compiled / build artefacts
+*.o
+*.so
+*.ninja
+.ninja_deps
+.ninja_log
+build/
+__pycache__/
+*.pyc
+
+# editor / environment
+.vscode/
+.claude/
+.env
+.conda/
+miniconda*/

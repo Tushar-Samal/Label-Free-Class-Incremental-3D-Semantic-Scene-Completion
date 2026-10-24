@@ -1,0 +1,17 @@
+--- a/configs/models/iascene.yaml
++++ b/configs/models/iascene.yaml
+@@ -24,10 +24,11 @@
+   decoder:
+     type: IASceneDecoder
+     embed_dims: 128
+-    ins_layers: 3 # TEMP
+-    bk_layers: 3
++    ins_layers: 2
++    bk_layers: 2
+ 
+-  criterions: [sem_scal, geo_scal, ce_ssc, bev_seg, geo_h, depth]
++  # criterions: [sem_scal, geo_scal, ce_ssc, bev_seg, geo_h, depth]
++  criterions: [sem_scal, geo_scal, ce_ssc]
+ 
+ optimizer:
+   paramwise_cfg:

@@ -1,0 +1,261 @@
+--- a/ssc_ia/models/losses/ssc_loss.py
++++ b/ssc_ia/models/losses/ssc_loss.py
+@@ -1,70 +1,124 @@
+ import torch
+ import torch.nn.functional as F
+ 
++def _get_cil_target(target, ignore_index: int = 255):
++    """
++    Returns (y, ignore_index) for loss computation.
++    - If disjoint CIL is enabled in dataset, use 'target_compact'
++    - else fallback to 'target'
++    """
++    if 'target_compact' in target:
++        return target['target_compact'], ignore_index
++    return target['target'], ignore_index
++
++def _get_cil_class_weights(target, num_classes: int):
++    """
++    Returns class weights compatible with current logits channels.
++    - If disjoint CIL: use 'cil_class_weights' if provided, else None
++    - Else: use full 'class_weights'
++    """
++    if 'target_compact' in target:
++        # best practice: pass cil_class_weights from dataloader/model
++        w = target.get('cil_class_weights', None)
++        if w is None:
++            return None
++        w = w.float()
++        assert len(w) == num_classes, f"cil_class_weights len {len(w)} != num_classes {num_classes}"
++        return w
++    else:
++        w = target.get('class_weights', None)
++        if w is None:
++            return None
++        w = w.float()
++        assert len(w) == num_classes, f"class_weights len {len(w)} != num_classes {num_classes}"
++        return w
+ 
+ def ce_ssc_loss(pred, target):
++    logits = pred['ssc_logits'].float()
++    y, ignore_index = _get_cil_target(target)
++
++    w = _get_cil_class_weights(target, num_classes=logits.shape[1])
++
+     return F.cross_entropy(
+-        pred['ssc_logits'].float(),
+-        target['target'].long(),
+-        weight=target['class_weights'].float(),
+-        ignore_index=255,
++        logits,
++        y.long(),
++        weight=w,
++        ignore_index=ignore_index,
+         reduction='mean',
+     )
+ 
+-
+ def sem_scal_loss(pred, target):
+     pred = pred['ssc_logits'].float()
+-    pred = F.softmax(pred, dim=1) # (bs, 20, 128, 128, 16)
+-    target = target['target']
+-    mask = target != 255
+-    target = target[mask]
++    pred = F.softmax(pred, dim=1)
++
++    y, ignore_index = _get_cil_target(target, ignore_index=255)
++    mask = (y != ignore_index)
++    y_flat = y[mask]
+ 
+-    loss, cnt = 0, 0
++    loss, cnt = 0.0, 0.0
+     num_classes = pred.shape[1]
+-    for i in range(0, num_classes):
+-        p = pred[:, i] # (bs, 128, 128, 16)
+-        p = p[mask]
+-        completion_target = torch.ones_like(target)
+-        completion_target[target != i] = 0
++    for i in range(num_classes):
++        p = pred[:, i]          # (bs, H, W, D)
++        p = p[mask]             # (N,)
++
++        completion_target = torch.ones_like(y_flat)
++        completion_target[y_flat != i] = 0
+ 
+         if torch.sum(completion_target) > 0:
+             cnt += 1.0
+             nominator = (p * completion_target).sum()
+             if p.sum() > 0:
+-                precision = nominator / p.sum()
++                precision = nominator / (p.sum() + 1e-12)
+                 loss += F.binary_cross_entropy(precision, torch.ones_like(precision))
+             if completion_target.sum() > 0:
+-                recall = nominator / completion_target.sum()
++                recall = nominator / (completion_target.sum() + 1e-12)
+                 loss += F.binary_cross_entropy(recall, torch.ones_like(recall))
+             if (1 - completion_target).sum() > 0:
+                 specificity = (((1 - p) * (1 - completion_target)).sum() /
+-                               (1 - completion_target).sum())
++                               ((1 - completion_target).sum() + 1e-12))
+                 loss += F.binary_cross_entropy(specificity, torch.ones_like(specificity))
+-    return loss / cnt
+ 
++    # Avoid divide-by-zero if cnt==0
++    return loss / max(cnt, 1.0)
+ 
+ def geo_scal_loss(pred, target):
+-    pred = pred['ssc_logits'].float()
+-    pred = F.softmax(pred, dim=1)
+-    target = target['target']
+-    mask = target != 255
++    pred_logits = pred['ssc_logits'].float()
++    pred_prob = F.softmax(pred_logits, dim=1)
++
++    y, ignore_index = _get_cil_target(target, ignore_index=255)
++    mask = (y != ignore_index)
++
++    # Probabilities for empty vs non-empty
++    empty_probs = pred_prob[:, 0]
++    nonempty_probs = 1.0 - empty_probs
+ 
+-    empty_probs = pred[:, 0]
+-    nonempty_probs = 1 - empty_probs
+     empty_probs = empty_probs[mask]
+     nonempty_probs = nonempty_probs[mask]
+ 
+-    nonempty_target = target != 0
++    nonempty_target = (y != 0)
+     nonempty_target = nonempty_target[mask].float()
+ 
+-    intersection = (nonempty_target * nonempty_probs).sum()
+-    precision = intersection / nonempty_probs.sum()
+-    recall = intersection / nonempty_target.sum()
+-    specificity = ((1 - nonempty_target) * (empty_probs)).sum() / (1 - nonempty_target).sum()
+-    return (F.binary_cross_entropy(precision, torch.ones_like(precision)) +
+-            F.binary_cross_entropy(recall, torch.ones_like(recall)) +
+-            F.binary_cross_entropy(specificity, torch.ones_like(specificity)))
++    loss = 0.0
+ 
++    # Precision/recall are only well-defined when the valid target region
++    # actually contains non-empty voxels. When it doesn't (e.g. a class
++    # group is fully excluded from target_compact, as with
++    # sam3_only_new_classes), nonempty_target.sum() == 0 forces recall to
++    # 0/eps and precision to ~0/eps, which saturates BCE's log-clamp at a
++    # constant ~100 each regardless of what the model predicts -- a
++    # degenerate, non-informative gradient. Skip both terms in that case.
++    if nonempty_target.sum() > 0:
++        intersection = (nonempty_target * nonempty_probs).sum()
++        precision = intersection / (nonempty_probs.sum() + 1e-12)
++        recall = intersection / (nonempty_target.sum() + 1e-12)
++        loss = loss + F.binary_cross_entropy(precision, torch.ones_like(precision))
++        loss = loss + F.binary_cross_entropy(recall, torch.ones_like(recall))
++
++    if (1 - nonempty_target).sum() > 0:
++        specificity = ((1 - nonempty_target) * empty_probs).sum() / ((1 - nonempty_target).sum() + 1e-12)
++        loss = loss + F.binary_cross_entropy(specificity, torch.ones_like(specificity))
++
++    return loss
+ 
+ def frustum_proportion_loss(pred, target):
+     pred = pred['ssc_logits'].float()
+@@ -96,42 +150,66 @@
+             frustum_nonempty += 1
+     return frustum_loss / frustum_nonempty
+ 
+-
+ def nonempty_binary_mask_loss(pred, target):
+-    binary_pred = pred['binary_pred']
+-    pred_shape = binary_pred.shape[1:]
++    binary_pred = pred['binary_pred']  # (bs, H', W', D') in your code
++    pred_shape = binary_pred.shape[1:]  # (H', W', D')
++
++    y, ignore_index = _get_cil_target(target, ignore_index=255)
++
++    # Non-empty = not background (0) and not ignore
++    tgt = ((y != 0) & (y != ignore_index)).float()
++    tgt = tgt.unsqueeze(1)  # (bs, 1, H, W, D)
++
++    tgt = F.interpolate(
++        tgt,
++        size=(pred_shape[0], pred_shape[1], pred_shape[2]),
++        mode='trilinear',
++        align_corners=False
++    )
+ 
+-    target = ((target['target'] != 0) & (target['target'] != 255)).long().float()
+-    target = target.unsqueeze(1) #(bs, 1, 128, 128, 16)
+-    target = F.interpolate(target, size=(pred_shape[0], pred_shape[1], pred_shape[2]), 
+-                           mode='trilinear', align_corners=False)
+-    
+     return F.binary_cross_entropy(
+-        binary_pred, #(bs, 64, 64, 4)
+-        target.squeeze(1), #(bs, 64, 64, 4)
++        binary_pred,          # (bs, H', W', D')
++        tgt.squeeze(1),       # (bs, H', W', D')
+         reduction='mean'
+     )
+ 
+-
+ def difficult_area_focus_loss(pred, target):
+-    cls_weight = target['class_weights'].float()
+-    target = target['target'] #(bs, 128, 128, 16)
+-    mask = (target != 255)
+-    target_shape = target.shape[1:]
+-    nonempty_mask = pred['nonempty_mask'].float().unsqueeze(1) #(bs, 1, 64, 64, 4)
+-    nonempty_mask = F.interpolate(nonempty_mask, size=(target_shape[0], target_shape[1], target_shape[2]),
+-                                  mode='nearest').squeeze(1).long().bool() #(bs, 128, 128, 16)
+-    
+-    target_flat = target[mask]
+-    counts = torch.bincount(target_flat, minlength=len(cls_weight))
+-    weighted_counts = counts.float() * torch.tensor(cls_weight)
+-    total_sum = weighted_counts.sum()
+-
+-    loss = F.cross_entropy(pred['ssc_logits'].float(), 
+-                           target.long(), 
+-                           weight=cls_weight, 
+-                           ignore_index=255, 
+-                           reduction='none')
+-    weights = torch.zeros_like(loss) + 0.5
+-    weights[nonempty_mask] = 3.0  # 20% nonempty
+-    return (loss * weights).sum() / total_sum # weighted_loss
+\ No newline at end of file
++    logits = pred['ssc_logits'].float()
++
++    y, ignore_index = _get_cil_target(target, ignore_index=255)
++    mask = (y != ignore_index)
++    tgt_shape = y.shape[1:]  # (H, W, D)
++
++    # Upsample predicted nonempty_mask to match target resolution
++    nonempty_mask = pred['nonempty_mask'].float().unsqueeze(1)  # (bs, 1, H', W', D')
++    nonempty_mask = F.interpolate(
++        nonempty_mask,
++        size=(tgt_shape[0], tgt_shape[1], tgt_shape[2]),
++        mode='nearest'
++    ).squeeze(1).bool()  # (bs, H, W, D)
++
++    # class weights: use step weights if disjoint, else full weights
++    cls_weight = _get_cil_class_weights(target, num_classes=logits.shape[1])
++
++    # per-voxel CE (no reduction)
++    per_voxel = F.cross_entropy(
++        logits,
++        y.long(),
++        weight=cls_weight,
++        ignore_index=ignore_index,
++        reduction='none'
++    )
++
++    # focus weights map
++    weights = torch.zeros_like(per_voxel) + 0.5
++    weights[nonempty_mask] = 3.0
++
++    # normalization similar to your original idea but made CIL-safe
++    if cls_weight is None:
++        denom = mask.sum().clamp_min(1).float()
++    else:
++        y_flat = y[mask].long()
++        counts = torch.bincount(y_flat, minlength=len(cls_weight)).float()
++        denom = (counts * cls_weight).sum().clamp_min(1e-12)
++
++    return (per_voxel * weights).sum() / denom
+\ No newline at end of file

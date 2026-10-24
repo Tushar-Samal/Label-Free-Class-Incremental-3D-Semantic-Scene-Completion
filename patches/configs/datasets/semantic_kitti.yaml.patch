@@ -1,0 +1,81 @@
+--- a/configs/datasets/semantic_kitti.yaml
++++ b/configs/datasets/semantic_kitti.yaml
+@@ -3,37 +3,60 @@
+   datasets:
+     type: SemanticKITTI
+     splits: [train, val, test]
+-    data_root: /mnt/A/hust_ley/Dataset_LEY/semantic_kitti
+-    label_root: /mnt/A/hust_ley/Dataset_LEY/semantic_kitti/dataset/labels
+-    depth_root: /mnt/A/hust_ley/Dataset_LEY/semantic_kitti/dataset/depth
++    # splits: [train]
++    data_root: datasets/kitti_odometry
++    label_root: datasets/preprocess/labels
++    depth_root: datasets/kitti_odometry/dataset/depth
++    cil_scenario: disjoint
++    # 5-step DCIL (2026-09-29): other-ground(12) and other-vehicle(5) dropped entirely,
++    # 17 classes rebalanced 4/3/3/3/4 across DISJOINT_SEQ's 5 sequence pairs.
++    # Step 4 -- 3D GT + RANDOM REPLAY (2026-10-09, new experiment
++    # track): same as the class-aware 3D-GT replay chain, but replay.strategy=random: a uniform
++    # per-sequence sample (images_per_seq_pct, seed 42) of every earlier sequence, with the pct
++    # tuned per step to give ~49 frames in total (same budget as the class-aware buffer).
++    continual_step: 4
++    continual_splits:
++      0: [9, 11, 15, 17]
++      1: [14, 16, 18]
++      2: [1, 6, 19]
++      3: [4, 10, 13]
++      4: [2, 3, 7, 8]
++    ignore_index: 255
++    empty_label: 0
++    cil_new_class_weight_boost: 1.0
++    replay:
++      enable: True
++      strategy: random          # random: images_per_seq_pct per sequence | file: buffer_file from tools/select_replay_buffer.py
++      buffer_file: null
++      images_per_seq_pct: 0.0245   # step4: 5+6+4+1+14+8+5+5=48 frames from seq 01/10/03/04/05/09/06/07
++      seed: 42
++    render2d:
++      enable: False
++      lambda_render2d: 1.0
++      new_class_ids: []
++      replay_via_render_steps: []
++      pc_range: [0.0, -25.6, -2.0, 51.2, 25.6, 4.4]
++      mask_root:  datasets/Fixed/5-step/SAM3/merged
++      ignore_index: 255
+     data_config:
+-      input_size: [384, 1280]
++      input_size: [192, 640]
+       resize: [0., 0.]
+       rot: [0.0, 0.0]
+       flip: False
+       crop_h: [0.0, 0.0]
+       resize_test: 0.00
+-    frustum_size: 8
++    frustum_size: 4
+   loader:
+     batch_size: 1
+     num_workers: 4
+ 
+ model:
+-  image_shape: [384, 1280]
+-  scene_size: [256, 256, 32]
++  image_shape: [192, 640]
++  scene_size: [96, 96, 16]
+   volume_scale: 2
+-  num_classes: 20
+-  class_frequencies: [
+-        5.41773033e09, 1.57835390e07, 1.25136000e05, 1.18809000e05, 6.46799000e05,
+-        8.21951000e05, 2.62978000e05, 2.83696000e05, 2.04750000e05, 6.16887030e07,
+-        4.50296100e06, 4.48836500e07, 2.26992300e06, 5.68402180e07, 1.57196520e07,
+-        1.58442623e08, 2.06162300e06, 3.69705220e07, 1.15198800e06, 3.34146000e05,
+-    ]
+   
+   decoder:
+-    bk_cls: 10 # empty + ['road', 'parking', 'sidewalk', 'other-ground', 'building', 'fence', 'vegetation', 'trunk', 'terrain']
+-    ins_cls: 11 # empty + ['car', 'bicycle', 'motorcycle', 'truck', 'other-vehicle', 'person', 'bicyclist', 'motorcyclist', 'pole', 'traffic-sign']
+-    feats_shape: [24, 80]
++    feats_shape: [12, 40]
++    
+ evaluator:
+   type: SSCMetrics
+-  num_classes: 20

@@ -1,0 +1,944 @@
+--- a/ssc_ia/engine/lit_module.py
++++ b/ssc_ia/engine/lit_module.py
+@@ -1,134 +1,881 @@
++import copy
++from collections import OrderedDict
++
+ import lightning as L
+ import torch
+ import torch.nn as nn
++import torch.nn.functional as F
+ import torch.optim as optim
+ from omegaconf import open_dict
+ from torch.cuda.amp import autocast
+ 
+ from .. import build_from_configs, evaluation, models
+ 
++from ssc_ia.models.losses.render_2d_loss import (
++    ProjectedPixOcc2DRenderer,
++    NewClassRenderLoss,
++)
+ 
+-class LitModule(L.LightningModule):
+ 
+-    def __init__(self, *, model, optimizer, scheduler, criterion=None, evaluator=None, seg_pretrain=None, **kwargs):
++class LitModule(L.LightningModule):
++    def __init__(
++        self,
++        *,
++        model,
++        optimizer,
++        scheduler,
++        criterion=None,
++        evaluator=None,
++        seg_pretrain=None,
++        **kwargs
++    ):
+         super().__init__()
++
++        self._init_model_cfg = copy.deepcopy(model)
++        self.model_meta_kwargs = dict(kwargs)
++
++        # -------------------------------------------------
++        # CIL meta-info
++        # -------------------------------------------------
++        self.num_classes = int(kwargs.get("num_classes", 20))
++        self.cil_class_weights = kwargs.get("cil_class_weights", None)
++        self.ignore_index = int(kwargs.get("ignore_label", kwargs.get("ignore_index", 255)))
++        self.empty_label = int(kwargs.get("empty_label", 0))
++
++        self.cil_scenario = kwargs.get("cil_scenario", None)
++        self.continual_step = int(kwargs.get("continual_step", 0))
++
++        self.base_global = kwargs.get("base_global_classes", None) or []
++        self.new_global = kwargs.get("new_global_classes", None) or []
++        self.old_global = kwargs.get("old_global_classes", None) or []
++        self.novel_global = kwargs.get("novel_global_classes", None) or []
++        self.future_global = kwargs.get("future_global_classes", None) or []
++        self.cur_global = kwargs.get("cur_global_classes", None) or []
++        self.seen_global = kwargs.get("seen_global_classes", None) or []
++
++        self.global_to_student = {g: i + 1 for i, g in enumerate(self.seen_global)}
++        self.student_to_global = {i + 1: g for i, g in enumerate(self.seen_global)}
++        self.compact_to_global = {0: 0, **self.student_to_global}
++
++        # -------------------------------------------------
++        # Pseudo-label config
++        # -------------------------------------------------
++        pseudo_cfg = kwargs.get("pseudo", None)
++
++        self.pseudo_enable = False
++        self.pseudo_mode = "offline"
++        self.pseudo_tau = 0.8
++        self.lambda_old = 1.0
++        self.pseudo_root = None
++
++        if pseudo_cfg is not None:
++            self.pseudo_enable = bool(getattr(pseudo_cfg, "enable", False))
++            self.pseudo_mode = str(getattr(pseudo_cfg, "mode", "offline"))
++            self.pseudo_tau = float(getattr(pseudo_cfg, "tau", 0.8))
++            self.lambda_old = float(getattr(pseudo_cfg, "lambda_old", 1.0))
++            self.pseudo_root = getattr(pseudo_cfg, "root", None)
++
++        self.teacher = None
++
++        # -------------------------------------------------
++        # 2D render supervision config
++        # -------------------------------------------------
++        render2d_cfg = kwargs.get("render2d", None)
++
++        self.render2d_enable = False
++        self.lambda_render2d = 1.0
++        self.render2d_new_class_ids = []
++        self.pc_range = None
++        self.sam3_only_new_classes = False
++        self.render2d_new_global_weight = 1.0
++        self.render2d_replay_via_render_steps = []
++
++        if render2d_cfg is not None:
++            self.render2d_enable = bool(getattr(render2d_cfg, "enable", False))
++            self.lambda_render2d = float(getattr(render2d_cfg, "lambda_render2d", 1.0))
++            self.render2d_new_class_ids = list(getattr(render2d_cfg, "new_class_ids", []))
++            self.pc_range = list(getattr(render2d_cfg, "pc_range", []))
++            self.sam3_only_new_classes = bool(getattr(render2d_cfg, "sam3_only_new_classes", False))
++            self.render2d_new_global_weight = float(
++                getattr(render2d_cfg, "new_global_weight", 1.0)
++            )
++            self.render2d_replay_via_render_steps = [
++                int(s) for s in getattr(render2d_cfg, "replay_via_render_steps", [])
++            ]
++
++        self.occ_2d_renderer = ProjectedPixOcc2DRenderer()
++
++        # Compact-id -> extra CE weight for render2d supervision. Compact ids
++        # in render2d_new_class_ids whose global class is in self.new_global
++        # (this continual step's newly-introduced classes) get
++        # render2d_new_global_weight instead of the default 1.0, so the
++        # render loss prioritizes learning new classes over reinforcing old
++        # ones it's also supervising.
++        self.render2d_class_weight_overrides = {}
++        if self.render2d_new_global_weight != 1.0:
++            for compact_id in self.render2d_new_class_ids:
++                global_id = self.compact_to_global.get(compact_id)
++                if global_id in self.new_global:
++                    self.render2d_class_weight_overrides[compact_id] = (
++                        self.render2d_new_global_weight
++                    )
++
++        self.new_class_render_loss = NewClassRenderLoss(
++            new_class_ids=self.render2d_new_class_ids,
++            ignore_index=self.ignore_index,
++            loss_weight=self.lambda_render2d,
++            class_weight_overrides=self.render2d_class_weight_overrides,
++        )
++
++        # Replay frames from an origin step listed in render2d.replay_via_render_steps
++        # are supervised through the render loss on the classes introduced at that
++        # step (the dataset sets the per-frame 'replay_via_render' flag and clears
++        # their 3D pseudo/real-GT channel). One loss per origin step.
++        splits = {int(k): list(v) for k, v in dict(kwargs.get("continual_splits") or {}).items()}
++        self.replay_render_class_ids = {
++            step: [self.global_to_student[g] for g in splits[step] if g in self.global_to_student]
++            for step in self.render2d_replay_via_render_steps
++        }
++        self.replay_render_losses = nn.ModuleDict({
++            str(step): NewClassRenderLoss(
++                new_class_ids=ids,
++                ignore_index=self.ignore_index,
++                loss_weight=self.lambda_render2d,
++                class_weight_overrides=None,
++            )
++            for step, ids in self.replay_render_class_ids.items()
++        })
++
++        # -------------------------------------------------
++        # Build student model
++        # -------------------------------------------------
+         self.model = build_from_configs(models, model, **kwargs)
++
+         self.optimizer = optimizer
+         self.scheduler = scheduler
+         self.criterion = build_from_configs(nn, criterion) if criterion else self.model.loss
+-        self.train_evaluator = build_from_configs(evaluation, evaluator)
+-        self.test_evaluator = build_from_configs(evaluation, evaluator)
+ 
+-        self.seg_pretrain_path = seg_pretrain 
+-        if 'class_names' in kwargs:
+-            self.class_names = kwargs['class_names']
++        self.train_evaluator = build_from_configs(
++            evaluation,
++            evaluator,
++            num_classes=self.num_classes,
++            meta_info=kwargs,
++        )
++        self.test_evaluator = build_from_configs(
++            evaluation,
++            evaluator,
++            num_classes=self.num_classes,
++            meta_info=kwargs,
++        )
++
++        self.seg_pretrain_path = seg_pretrain
++
++        if "class_names" in kwargs:
++            self.class_names = kwargs["class_names"]
++
++        print("[LitModule DEBUG] num_classes =", self.num_classes)
++        print("[LitModule DEBUG] continual_step =", self.continual_step)
++        print("[LitModule DEBUG] old_global =", self.old_global)
++        print("[LitModule DEBUG] new_global =", self.new_global)
++        print("[LitModule DEBUG] seen_global =", self.seen_global)
++        print("[LitModule DEBUG] global_to_student =", self.global_to_student)
++        print("[LitModule DEBUG] compact_to_global =", self.compact_to_global)
++        print("[LitModule DEBUG] pseudo_enable =", self.pseudo_enable)
++        print("[LitModule DEBUG] pseudo_mode =", self.pseudo_mode)
++        print("[LitModule DEBUG] pseudo_tau =", self.pseudo_tau)
++        print("[LitModule DEBUG] lambda_old =", self.lambda_old)
++        print("[LitModule DEBUG] pseudo_root =", self.pseudo_root)
++
++        print("[LitModule DEBUG] render2d_enable =", self.render2d_enable)
++        print("[LitModule DEBUG] lambda_render2d =", self.lambda_render2d)
++        print("[LitModule DEBUG] render2d_new_class_ids =", self.render2d_new_class_ids)
++        print("[LitModule DEBUG] pc_range =", self.pc_range)
++        print("[LitModule DEBUG] sam3_only_new_classes =", self.sam3_only_new_classes)
++        print("[LitModule DEBUG] render2d_new_global_weight =", self.render2d_new_global_weight)
++        print("[LitModule DEBUG] render2d_class_weight_overrides =", self.render2d_class_weight_overrides)
++        print("[LitModule DEBUG] render2d_replay_via_render_steps =", self.render2d_replay_via_render_steps)
++        print("[LitModule DEBUG] replay_render_class_ids =", self.replay_render_class_ids)
++
++        if self.pseudo_enable:
++            print("\n[LitModule INFO] This build uses OFFLINE pseudo-labels only.")
++            print("Expected batch keys: 'pseudo_old_compact' and 'pseudo_old_mask'")
++            print("No teacher forward will be run inside training.\n")
++
++        if self.render2d_enable:
++            print("\n[LitModule INFO] 2D render supervision is enabled.")
++            print("Expected target keys: 'new_2d_semantic' and optionally 'new_2d_valid'")
++            print("Expected input keys: 'projected_pix_1' and 'fov_mask_1'\n")
++
++        if self.render2d_replay_via_render_steps:
++            print("\n[LitModule INFO] Replay frames from steps", self.render2d_replay_via_render_steps,
++                  "are supervised through the 2D render loss on their own step's classes")
++            print("(replay_render_class_ids above); their 3D pseudo/real-GT channel is empty by design.\n")
++
++            if self.sam3_only_new_classes:
++                print(
++                    "[LitModule INFO] sam3_only_new_classes=True: new-class voxels will be "
++                    "masked to ignore_index in target_compact, so ce_ssc/sem_scal/geo_scal "
++                    "contribute NO gradient to new-class channels. The SAM3 render loss is "
++                    "their sole supervision source.\n"
++                )
+ 
+     def forward(self, x):
+         return self.model(x)
+ 
+-    def _step(self, batch, evaluator=None):
++    @staticmethod
++    def _last_if_list(v):
++        if isinstance(v, (list, tuple)):
++            return v[-1]
++        return v
++
++    def setup(self, stage=None):
++        self.teacher = None
++
++    def on_load_checkpoint(self, checkpoint: dict) -> None:
++        """
++        Called by Lightning on every rank before load_state_dict.
++
++        Detects cross-step loading by peeking at shape mismatches in
++        checkpoint["state_dict"] (read-only — keys are NOT removed here).
++        If mismatches are found, neutralises optimizer / scheduler / epoch
++        restoration so Step k starts a fresh training run from epoch 0.
++
++        For within-step resume (no shape mismatches) this is a no-op.
++
++        NOTE: optimizer_states and lr_schedulers must be *emptied*, not
++        *removed* — Lightning raises KeyError if those keys are absent
++        (checkpoint_connector.py lines 361-372).
++        """
++        state_dict = checkpoint.get("state_dict", {})
++        model_state = self.state_dict()
++
++        mismatched = [
++            k for k, v in state_dict.items()
++            if k in model_state
++            and tuple(v.shape) != tuple(model_state[k].shape)
++        ]
++
++        if not mismatched:
++            return  # within-step resume — do nothing
++
++        print(
++            f"\n[CIL CKPT] Cross-step load detected "
++            f"(continual_step={self.continual_step}). "
++            f"{len(mismatched)} shape-mismatched key(s) will be "
++            f"expanded (old channels copied, new channels random-init):"
++        )
++        for k in mismatched:
++            print(
++                f"  EXPAND  {k}:  "
++                f"ckpt={tuple(state_dict[k].shape)}  "
++                f"->  model={tuple(model_state[k].shape)}"
++            )
++
++        # Empty (not remove) optimizer / scheduler state so the zip-loops
++        # in restore_optimizers() / restore_lr_schedulers() iterate 0 times.
++        checkpoint["optimizer_states"] = []
++        checkpoint["lr_schedulers"] = []
++
++        # Remove loop-progress so restore_loops() skips epoch restoration
++        # and training starts from epoch 0.
++        checkpoint.pop("loops", None)
++
++        # Remove callback states (notably ModelCheckpoint's best_model_score)
++        # so this step's "best" tracking starts fresh instead of inheriting
++        # the previous step's score, which is on an unrelated class set and
++        # would otherwise permanently block this step from ever saving a
++        # new best checkpoint. checkpoint.get("callbacks") returning None
++        # makes Lightning's _call_callbacks_load_state_dict skip restoration
++        # cleanly (unlike optimizer_states/lr_schedulers, no KeyError risk).
++        checkpoint.pop("callbacks", None)
++
++        print(
++            "[CIL CKPT] Cleared optimizer_states, lr_schedulers, loops, callbacks. "
++            "Step will start from epoch 0 with a fresh optimizer and fresh "
++            "best-checkpoint tracking.\n"
++        )
++
++    def load_state_dict(
++        self,
++        state_dict: dict,
++        strict: bool = True,
++    ):
++        """
++        Override to handle cross-step weight transfer safely.
++
++        strict=False (e.g. on_fit_start seg_pretrain path):
++            Passes through unchanged — caller already chose permissive loading.
++
++        strict=True, no shape mismatches (within-step resume):
++            Delegates to super() with strict=True — identical to default behaviour.
++
++        strict=True, shape mismatches present (cross-step):
++            1. Strips the mismatched keys from state_dict.
++            2. Calls super() with strict=False.
++            3. Asserts the ONLY missing keys are the ones we stripped.
++            4. Asserts there are no unexpected extra keys.
++            Raises RuntimeError for any other deviation so unrelated
++            checkpoint / model mismatches are still caught.
++        """
++        if not strict:
++            return super().load_state_dict(state_dict, strict=False)
++
++        model_state = self.state_dict()
++
++        mismatched_keys = {
++            k for k, v in state_dict.items()
++            if k in model_state
++            and tuple(v.shape) != tuple(model_state[k].shape)
++        }
++
++        if not mismatched_keys:
++            # No cross-step divergence — full strict load as normal.
++            return super().load_state_dict(state_dict, strict=True)
++
++        # Cross-step: expand class heads (copy old channels, keep random new ones)
++        # instead of fully discarding them.  This preserves the step-0 classifier
++        # weights for the old classes while only randomly initialising new channels.
++        # Use OrderedDict and copy _metadata so that spconv's compat hook
++        # (SparseModule._load_from_state_dict) sees version=2 and does NOT
++        # permute spconv-2.x weights as if they were spconv-1.x weights.
++        patched = OrderedDict()
++        expanded_keys = []
++        skipped_keys = []
++        for k, v in state_dict.items():
++            if k not in mismatched_keys:
++                patched[k] = v
++                continue
++            model_v = model_state[k]
++            ckpt_v = v
++            # Head-expansion case: same rank, same trailing dims, ckpt has fewer
++            # output channels than the current model (dim-0 grew).
++            if (
++                ckpt_v.ndim == model_v.ndim
++                and ckpt_v.shape[0] < model_v.shape[0]
++                and ckpt_v.shape[1:] == model_v.shape[1:]
++            ):
++                expanded = model_v.clone()            # start from random init
++                expanded[:ckpt_v.shape[0]] = ckpt_v  # overwrite old-class channels
++                patched[k] = expanded
++                expanded_keys.append(k)
++                print(
++                    f"  EXPAND {k}: ckpt={tuple(ckpt_v.shape)} -> model={tuple(model_v.shape)}, "
++                    f"copied first {ckpt_v.shape[0]} channels, "
++                    f"randomly initialised remaining {model_v.shape[0] - ckpt_v.shape[0]}"
++                )
++            else:
++                # Non-expansion mismatch: skip (model keeps random init).
++                skipped_keys.append(k)
++                print(
++                    f"  SKIP   {k}: ckpt={tuple(ckpt_v.shape)} incompatible with "
++                    f"model={tuple(model_v.shape)}"
++                )
++
++        if hasattr(state_dict, "_metadata"):
++            patched._metadata = state_dict._metadata  # type: ignore[attr-defined]
++
++        result = super().load_state_dict(patched, strict=False)
++
++        # Validate: the only missing keys must be exactly the ones we skipped.
++        unexpected_missing = set(result.missing_keys) - mismatched_keys
++        if unexpected_missing:
++            raise RuntimeError(
++                "[CIL CKPT] Unexpected missing key(s) after cross-step load "
++                "(not caused by shape mismatch — check the checkpoint):\n"
++                + "\n".join(f"  {k}" for k in sorted(unexpected_missing))
++            )
++
++        # Validate: no extra keys in the checkpoint that the model doesn't have.
++        if result.unexpected_keys:
++            raise RuntimeError(
++                "[CIL CKPT] Unexpected extra key(s) in checkpoint "
++                "(not present in the current model):\n"
++                + "\n".join(f"  {k}" for k in sorted(result.unexpected_keys))
++            )
++
++        print(f"[CIL CKPT] Loaded cross-step checkpoint successfully.")
++        print(f"[CIL CKPT] Loaded/expanded weights: {len(patched)} tensor(s).")
++        if expanded_keys:
++            print(
++                f"[CIL CKPT] Expanded class heads (old channels preserved, new=random): "
++                f"{len(expanded_keys)} tensor(s): "
++                + ", ".join(sorted(expanded_keys))
++            )
++        if skipped_keys:
++            print(
++                f"[CIL CKPT] Randomly re-initialised (shape incompatible): "
++                f"{len(skipped_keys)} tensor(s): "
++                + ", ".join(sorted(skipped_keys))
++            )
++
++        return result
++
++    def _inject_cil_weights(self, y):
++        if isinstance(y, dict) and (self.cil_class_weights is not None):
++            if "cil_class_weights" not in y:
++                y["cil_class_weights"] = self.cil_class_weights.to(self.device)
++        return y
++
++    def _prepare_target_for_loss(self, y):
++        """
++        Main CE loss should consume seen-compact targets when available.
++        """
++        if not isinstance(y, dict):
++            return y
++
++        y_for_loss = dict(y)
++
++        if "target_new_only_compact" in y_for_loss:
++            y_for_loss["target_compact"] = y_for_loss["target_new_only_compact"]
++        elif "target_seen_compact" in y_for_loss:
++            y_for_loss["target_compact"] = y_for_loss["target_seen_compact"]
++
++        if (
++            self.sam3_only_new_classes
++            and self.render2d_enable
++            and self.continual_step > 0
++            and torch.is_tensor(y_for_loss.get("target_compact"))
++        ):
++            # New classes are meant to be supervised by the SAM3 render loss
++            # only. Strip them out of target_compact so ce_ssc/sem_scal/
++            # geo_scal (the main criterion) never see them as GT — mirrors
++            # how old-class voxels are already excluded via ignore_index.
++            new_class_compact_ids = [
++                self.global_to_student[g]
++                for g in self.new_global
++                if g in self.global_to_student
++            ]
++
++            if new_class_compact_ids:
++                target_compact = y_for_loss["target_compact"].clone()
++                new_ids = torch.tensor(
++                    new_class_compact_ids,
++                    device=target_compact.device,
++                    dtype=target_compact.dtype,
++                )
++                target_compact[torch.isin(target_compact, new_ids)] = self.ignore_index
++                y_for_loss["target_compact"] = target_compact
++
++        return y_for_loss
++
++    def compute_pseudo_loss(self, student_logits, pseudo_student, valid_mask):
++        """
++        student_logits: [B, C, X, Y, Z]
++        pseudo_student: [B, X, Y, Z]
++        valid_mask: [B, X, Y, Z]
++        """
++        if valid_mask.sum() == 0:
++            return student_logits.sum() * 0.0
++
++        C = student_logits.shape[1]
++
++        logits_flat = student_logits.permute(0, 2, 3, 4, 1).reshape(-1, C)
++        pseudo_flat = pseudo_student.reshape(-1)
++        mask_flat = valid_mask.reshape(-1)
++
++        logits_kept = logits_flat[mask_flat]
++        pseudo_kept = pseudo_flat[mask_flat]
++
++        return F.cross_entropy(logits_kept, pseudo_kept, reduction="mean")
++
++    def _get_offline_pseudo_from_batch(self, y, device):
++        """
++        Expects:
++            y["pseudo_old_compact"] : [B, X, Y, Z]
++            y["pseudo_old_mask"]    : [B, X, Y, Z]
++        """
++        if not isinstance(y, dict):
++            return None, None
++
++        if "pseudo_old_compact" not in y or "pseudo_old_mask" not in y:
++            return None, None
++
++        pseudo_student = y["pseudo_old_compact"]
++        valid_mask = y["pseudo_old_mask"]
++
++        if pseudo_student is None or valid_mask is None:
++            return None, None
++
++        pseudo_student = pseudo_student.long().to(device, non_blocking=True)
++        valid_mask = valid_mask.bool().to(device, non_blocking=True)
++
++        return pseudo_student, valid_mask
++
++    def compute_render2d_loss(self, student_logits, x, y):
++        """
++        student_logits: [B, C, X, Y, Z]
++
++        Uses precomputed:
++            x["projected_pix_1"] : [B, X*Y*Z, 2]
++            x["fov_mask_1"]      : [B, X*Y*Z]
++
++        This avoids needing lidar2img.
++        """
++        if not self.render2d_enable:
++            return student_logits.sum() * 0.0
++
++        # Replay frames whose origin step is routed via the render loss supervise the
++        # classes introduced at that step through this projection — batch_size is 1
++        # in this project, so a batch is unambiguously one kind of frame.
++        via_render_batch = False
++        if isinstance(y, dict) and "replay_via_render" in y:
++            via_render_batch = bool(y["replay_via_render"].reshape(-1)[0].item())
++
++        if via_render_batch:
++            origin_step = int(y["replay_origin_step"].reshape(-1)[0].item())
++            active_loss = self.replay_render_losses[str(origin_step)]
++            active_class_ids = self.replay_render_class_ids[origin_step]
++        else:
++            active_loss = self.new_class_render_loss
++            active_class_ids = self.render2d_new_class_ids
++
++        if active_loss is None or active_class_ids is None or len(active_class_ids) == 0:
++            return student_logits.sum() * 0.0
++
++        if not isinstance(y, dict) or "new_2d_semantic" not in y:
++            return student_logits.sum() * 0.0
++
++        if not isinstance(x, dict):
++            return student_logits.sum() * 0.0
++
++        if "projected_pix_1" not in x or "fov_mask_1" not in x:
++            return student_logits.sum() * 0.0
++
++        target_2d = y["new_2d_semantic"].long().to(
++            student_logits.device,
++            non_blocking=True,
++        )
++
++        valid_2d = y.get("new_2d_valid", None)
++        if valid_2d is not None:
++            valid_2d = valid_2d.bool().to(student_logits.device, non_blocking=True)
++
++        projected_pix = x["projected_pix_1"].to(
++            student_logits.device,
++            non_blocking=True,
++        )
++        fov_mask = x["fov_mask_1"].to(
++            student_logits.device,
++            non_blocking=True,
++        ).bool()
++
++        # Restrict the z-buffer competition to voxels that are actually
++        # occupied in 3D GT. Without this, "nearest voxel in the frustum"
++        # is almost always empty air near the sensor rather than the true
++        # surface, so the render loss attaches new-class targets to voxels
++        # the 3D CE loss simultaneously (and correctly) labels as empty.
++        occ_source = y.get("target_global", None)
++        if occ_source is None:
++            occ_source = y.get("target_seen_compact", None)
++
++        if isinstance(occ_source, torch.Tensor) and occ_source.dim() >= 3:
++            occ_source = occ_source.long().to(student_logits.device, non_blocking=True)
++            occ_flat = occ_source.reshape(occ_source.shape[0], -1)
++            occ_mask = (occ_flat != self.empty_label) & (occ_flat != self.ignore_index)
++            if occ_mask.shape == fov_mask.shape:
++                fov_mask = fov_mask & occ_mask
++
++        pix_z = x.get("pix_z_1", None)
++        if pix_z is not None:
++            pix_z = pix_z.to(student_logits.device, non_blocking=True)
++
++        rendered_logits = self.occ_2d_renderer(
++            occ_logits=student_logits,
++            projected_pix=projected_pix,
++            fov_mask=fov_mask,
++            img_hw=target_2d.shape[-2:],
++            pix_z=pix_z,
++        )
++
++        loss_render2d = active_loss(
++            rendered_logits=rendered_logits,
++            target_2d=target_2d,
++            valid_2d=valid_2d,
++        )
++
++        return loss_render2d
++
++    def _step(self, batch, evaluator=None, use_pseudo=True):
+         x, y = batch
++
++        if getattr(self, "_debug_batch_printed", False):
++            pass
++        else:
++            print("\n========== STEP DEBUG: INPUT INFO ==========")
++
++            if isinstance(x, dict):
++                print("input keys:", sorted(list(x.keys())))
++
++                for k, v in x.items():
++                    if torch.is_tensor(v):
++                        print(f"x[{k}] shape:", tuple(v.shape))
++                    elif isinstance(v, (list, tuple)):
++                        print(f"x[{k}] type:", type(v), "len:", len(v))
++                    else:
++                        print(f"x[{k}] type:", type(v))
++            else:
++                print("x type:", type(x))
++                if torch.is_tensor(x):
++                    print("x shape:", tuple(x.shape))
++
++            print("============================================\n")
++
++            print("\n========== STEP DEBUG: TARGET INFO ==========")
++            print("continual_step:", self.continual_step)
++            print("num_classes:", self.num_classes)
++            print("ignore_index:", self.ignore_index)
++            print("old_global:", self.old_global)
++            print("new_global:", self.new_global)
++            print("seen_global:", self.seen_global)
++
++            if isinstance(y, dict):
++                print("target keys:", sorted(list(y.keys())))
++
++                if "target" in y:
++                    print("target shape:", tuple(y["target"].shape))
++                    print("target unique:", torch.unique(y["target"]).detach().cpu().tolist()[:50])
++
++                if "target_compact" in y:
++                    print("target_compact shape:", tuple(y["target_compact"].shape))
++                    print("target_compact unique:", torch.unique(y["target_compact"]).detach().cpu().tolist()[:50])
++
++                if "target_seen_compact" in y:
++                    print("target_seen_compact shape:", tuple(y["target_seen_compact"].shape))
++                    print("target_seen_compact unique:", torch.unique(y["target_seen_compact"]).detach().cpu().tolist()[:50])
++
++                if "pseudo_old_compact" in y:
++                    print("pseudo_old_compact shape:", tuple(y["pseudo_old_compact"].shape))
++                    print("pseudo_old_compact unique:", torch.unique(y["pseudo_old_compact"]).detach().cpu().tolist()[:50])
++
++                if "pseudo_old_mask" in y:
++                    print("pseudo_old_mask shape:", tuple(y["pseudo_old_mask"].shape))
++                    print("pseudo_old_mask mean:", float(y["pseudo_old_mask"].float().mean().detach().cpu()))
++
++                if "new_2d_semantic" in y:
++                    print("new_2d_semantic shape:", tuple(y["new_2d_semantic"].shape))
++                    print("new_2d_semantic unique:", torch.unique(y["new_2d_semantic"]).detach().cpu().tolist()[:50])
++
++                if "new_2d_valid" in y:
++                    print("new_2d_valid shape:", tuple(y["new_2d_valid"].shape))
++                    print("new_2d_valid mean:", float(y["new_2d_valid"].float().mean().detach().cpu()))
++
++            print("=============================================\n")
++            self._debug_batch_printed = True
++
++        y = self._inject_cil_weights(y)
+         pred = self(x)
++
++        if getattr(self, "_debug_pred_printed", False) is False:
++            print("\n========== STEP DEBUG: PRED INFO ==========")
++            if isinstance(pred, dict):
++                print("pred keys:", sorted(list(pred.keys())))
++
++                if "ssc_logits" in pred:
++                    ssc_logits = self._last_if_list(pred["ssc_logits"])
++                    print("ssc_logits shape:", tuple(ssc_logits.shape))
++
++                    pred_lbl = torch.argmax(ssc_logits.detach(), dim=1)
++                    print("pred_lbl unique:", torch.unique(pred_lbl).detach().cpu().tolist()[:50])
++
++            print("===========================================\n")
++            self._debug_pred_printed = True
++
++        y_for_loss = self._prepare_target_for_loss(y)
++
+         with autocast(enabled=False):
+-            loss = self.criterion(pred, y)
++            loss = self.criterion(pred, y_for_loss)
++
++        # -------------------------------------------------
++        # OFFLINE pseudo loss for old classes
++        # -------------------------------------------------
++        if (
++            use_pseudo
++            and self.pseudo_enable
++            and self.pseudo_mode == "offline"
++            and self.continual_step > 0
++        ):
++            student_logits = self._last_if_list(pred["ssc_logits"])
++            pseudo_student, valid_mask = self._get_offline_pseudo_from_batch(
++                y,
++                student_logits.device,
++            )
++
++            if pseudo_student is not None and valid_mask is not None:
++                loss_old = self.compute_pseudo_loss(
++                    student_logits,
++                    pseudo_student,
++                    valid_mask,
++                )
++
++                if isinstance(loss, dict):
++                    loss["loss_pseudo_old"] = self.lambda_old * loss_old
++                    loss["pseudo_coverage"] = valid_mask.float().mean()
++                else:
++                    loss = {
++                        "loss_main": loss,
++                        "loss_pseudo_old": self.lambda_old * loss_old,
++                        "pseudo_coverage": valid_mask.float().mean(),
++                    }
++
++        # -------------------------------------------------
++        # 2D render loss for new classes
++        # -------------------------------------------------
++        if (
++            use_pseudo
++            and self.render2d_enable
++            and self.continual_step > 0
++        ):
++            student_logits = self._last_if_list(pred["ssc_logits"])
++            loss_render2d = self.compute_render2d_loss(student_logits, x, y)
++
++            if isinstance(loss, dict):
++                loss["loss_render2d_new"] = loss_render2d
++            else:
++                loss = {
++                    "loss_main": loss,
++                    "loss_render2d_new": loss_render2d,
++                }
++
+         if evaluator:
+-            pred = {key:value[-1] for key, value in pred.items()}
+-            evaluator.update(pred, y)
++            pred_eval = {k: self._last_if_list(v) for k, v in pred.items()}
++            evaluator.update(pred_eval, y_for_loss)
++
+         return loss
+ 
+     def training_step(self, batch, batch_idx):
+-        loss = self._step(batch, self.train_evaluator)
++        loss = self._step(batch, self.train_evaluator, use_pseudo=True)
++
+         if isinstance(loss, dict):
+-            loss['loss_total'] = sum(loss.values())
+-            self.log_dict({f'train/{k}': v for k, v in loss.items()}, prog_bar=True)
+-        else:
+-            self.log('train/loss', loss)
+-        return sum(loss.values()) if isinstance(loss, dict) else loss
++            log_vals = {}
++            total = None
++
++            for k, v in loss.items():
++                log_vals[f"train/{k}"] = v
++
++                if "pseudo_coverage" not in k:
++                    total = v if total is None else total + v
++
++            log_vals["train/loss_total"] = total
++            self.log_dict(log_vals, prog_bar=True, batch_size=1)
++            return total
++
++        self.log("train/loss", loss, batch_size=1)
++        return loss
+ 
+     def validation_step(self, batch, batch_idx):
+-        self._shared_eval(batch, 'val')
++        self._shared_eval(batch, "val")
+ 
+     def test_step(self, batch, batch_idx):
+-        self._shared_eval(batch, 'test')
++        self._shared_eval(batch, "test")
+ 
+     def _shared_eval(self, batch, prefix):
+-        loss = self._step(batch, self.test_evaluator)
+-        # Lightning automatically accumulates the metric and averages it
+-        # if `self.log` is inside the `validation_step` and `test_step`
++        loss = self._step(batch, self.test_evaluator, use_pseudo=False)
+ 
+         if isinstance(loss, dict):
+-            loss['loss_total'] = sum(loss.values())
+-            self.log_dict({f'{prefix}/{k}': v for k, v in loss.items()}, sync_dist=True)
++            log_vals = {}
++            total = None
++
++            for k, v in loss.items():
++                log_vals[f"{prefix}/{k}"] = v
++
++                if "pseudo_coverage" not in k:
++                    total = v if total is None else total + v
++
++            log_vals[f"{prefix}/loss_total"] = total
++            self.log_dict(log_vals, sync_dist=True, batch_size=1)
+         else:
+-            self.log(f'{prefix}/loss', loss, sync_dist=True)
++            self.log(f"{prefix}/loss", loss, sync_dist=True, batch_size=1)
+ 
+     def on_train_epoch_end(self):
+-        self._log_metrics(self.train_evaluator, 'train')
++        self._log_metrics(self.train_evaluator, "train")
+ 
+     def on_validation_epoch_end(self):
+-        self._log_metrics(self.test_evaluator, 'val')
++        self._log_metrics(self.test_evaluator, "val")
+ 
+     def on_test_epoch_end(self):
+-        self._log_metrics(self.test_evaluator, 'test')
++        self._log_metrics(self.test_evaluator, "test")
+ 
+     def _log_metrics(self, evaluator, prefix=None):
+         metrics = evaluator.compute()
+-        iou_per_class = metrics.pop('iou_per_class')
++        iou_per_class = metrics.pop("iou_per_class")
++
+         if prefix:
+-            metrics = {'/'.join((prefix, k)): v for k, v in metrics.items()}
++            metrics = {"/".join((prefix, k)): v for k, v in metrics.items()}
++
+         self.log_dict(metrics, sync_dist=True)
+ 
+-        if hasattr(self, 'class_names'):
+-            self.log_dict(
+-                {
+-                    f'{prefix}/iou_{c}': s.item()
+-                    for c, s in zip(self.class_names, iou_per_class)
+-                },
+-                sync_dist=True)
++        if hasattr(self, "class_names"):
++            if len(self.class_names) == len(iou_per_class):
++                # iou_per_class is indexed by this run's *compact* class id,
++                # while self.class_names is indexed by *global* class id
++                # (fixed SemanticKITTI order). These only coincide at
++                # continual_step 0 -- for later CIL steps, compact order is
++                # DCIL insertion order, not global order, so each compact
++                # index must be routed through compact_to_global before
++                # looking up its name. A positional zip here previously
++                # logged every post-Step-0 per-class IoU under the wrong
++                # class name (e.g. "iou_car" held road's IoU in Step 2).
++                self.log_dict(
++                    {
++                        f"{prefix}/iou_{self.class_names[self.compact_to_global[c]]}": s.item()
++                        for c, s in enumerate(iou_per_class)
++                    },
++                    sync_dist=True,
++                )
++
+         evaluator.reset()
+ 
+     def on_fit_start(self):
+-        if self.seg_pretrain_path != None:
+-            pretrained_weights = torch.load(self.seg_pretrain_path)
+-            self.load_state_dict(pretrained_weights['state_dict'], strict=False)
+-            
+-            # # Freeze
+-            # for name, param in self.model.named_parameters():
+-            #     if 'ins_decoder' not in name:
+-            #         param.requires_grad = False
++        if self.seg_pretrain_path is not None:
++            pretrained_weights = torch.load(self.seg_pretrain_path, map_location="cpu")
++            self.load_state_dict(pretrained_weights["state_dict"], strict=False)
+ 
+     def configure_optimizers(self):
+         optimizer_cfg = self.optimizer
+         scheduler_cfg = self.scheduler
++
+         with open_dict(optimizer_cfg):
+-            paramwise_cfg = optimizer_cfg.pop('paramwise_cfg', None)
++            paramwise_cfg = optimizer_cfg.pop("paramwise_cfg", None)
++
+         if paramwise_cfg:
+             params = []
+             pgs = [[] for _ in paramwise_cfg]
+ 
+             for k, v in self.named_parameters():
+                 in_param_group = False
++
+                 for i, pg_cfg in enumerate(paramwise_cfg):
+-                    if 'name' in pg_cfg and pg_cfg.name in k:
++                    if "name" in pg_cfg and pg_cfg.name in k:
+                         pgs[i].append(v)
+                         in_param_group = True
+-                    # USER: Customize more cfgs if needed
++
+                 if not in_param_group:
+                     params.append(v)
+         else:
+             params = self.parameters()
++
+         optimizer = build_from_configs(optim, optimizer_cfg, params=params)
++
+         if paramwise_cfg:
+             for pg, pg_cfg in zip(pgs, paramwise_cfg):
+                 cfg = {}
+-                if 'lr_mult' in pg_cfg:
+-                    cfg['lr'] = optimizer_cfg.lr * pg_cfg.lr_mult
+-                # USER: Customize more cfgs if needed
+-                optimizer.add_param_group({'params': pg, **cfg})
+-        scheduler = build_from_configs(optim.lr_scheduler, scheduler_cfg, optimizer=optimizer)
+-        if 'interval' in scheduler_cfg:
+-            scheduler = {'scheduler': scheduler, 'interval': scheduler_cfg.interval}
+-
+-        # NOTE : For ReduceLROnPlateau scheduler
+-        scheduler = {'scheduler': scheduler, 'monitor': 'val/mIoU', 'interval': 'epoch', 'frequency': 1}
+-        return {'optimizer': optimizer, 'lr_scheduler': scheduler}
++
++                if "lr_mult" in pg_cfg:
++                    cfg["lr"] = optimizer_cfg.lr * pg_cfg.lr_mult
++
++                optimizer.add_param_group({"params": pg, **cfg})
++
++        scheduler = build_from_configs(
++            optim.lr_scheduler,
++            scheduler_cfg,
++            optimizer=optimizer,
++        )
++
++        scheduler = {
++            "scheduler": scheduler,
++            "monitor": "val/mIoU",
++            "interval": "epoch",
++            "frequency": 1,
++        }
++
++        return {"optimizer": optimizer, "lr_scheduler": scheduler}
+\ No newline at end of file

@@ -1,0 +1,32 @@
+--- a/ssc_ia/models/decoders/decoder.py
++++ b/ssc_ia/models/decoders/decoder.py
+@@ -72,7 +72,7 @@
+         
+         # cls_head
+         self.cls_head = nn.Sequential(
+-            Upsample(embed_dims, embed_dims) if project_scale == 2 else nn.Identity(),
++            Upsample(embed_dims, embed_dims) if project_scale != 1 else nn.Identity(),
+             nn.Conv3d(embed_dims, num_cls, kernel_size=1))
+ 
+ 
+@@ -139,7 +139,15 @@
+         volume = local_feats * weights[:, 0:1, ...] + global_feats[0] * weights[:, 1:2, ...] + \
+             global_feats[1] * weights[:, 2:3, ...]
+         
+-        ssc_outs.append(self.cls_head(volume))
+-        
+-        return {'ssc_logits': ssc_outs, 'bev_seg_ins':seg_ins, 'bev_seg_bk': seg_bk, 'seg_img': seg_img, 'h_ins':h_ins, 'h_bk':h_bk, \
+-                'bev_ins_mask': bev_ins_mask, 'params':params}  # For Vis
+\ No newline at end of file
++        ssc_logits = self.cls_head(volume)  # (B, C, L, W, H)
++
++        return {
++            'ssc_logits': ssc_logits,
++            'bev_seg_ins': seg_ins,
++            'bev_seg_bk': seg_bk,
++            'seg_img': seg_img,
++            'h_ins': h_ins,
++            'h_bk': h_bk,
++            'bev_ins_mask': bev_ins_mask,
++            'params': params
++        }

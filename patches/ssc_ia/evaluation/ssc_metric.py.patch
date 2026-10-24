@@ -1,0 +1,329 @@
+--- a/ssc_ia/evaluation/ssc_metric.py
++++ b/ssc_ia/evaluation/ssc_metric.py
+@@ -3,107 +3,252 @@
+ 
+ 
+ class SSCMetrics(Metric):
++    """
++    Seen-compact CIL evaluation:
+ 
+-    def __init__(self, num_classes, ignore_index=255):
+-        super().__init__()
+-        self.num_classes = num_classes
+-        self.ignore_index = ignore_index
+-
+-        for metric in ('tp_sc', 'fp_sc', 'fn_sc'):
+-            self.add_state(metric, torch.tensor(0), dist_reduce_fx='sum')
+-        for metric in ('tps_ssc', 'fps_ssc', 'fns_ssc'):
+-            self.add_state(metric, torch.zeros(num_classes), dist_reduce_fx='sum')
++    - Assumes logits are in compact seen-space:
++        0 = background
++        1..K = seen classes up to current step
++    - Evaluates against target_seen_compact when available
++    - mIoU = mean IoU over ALL CLASSES SEEN SO FAR (base + every step up to and including current)
++    - BkmIoU = mean IoU over CURRENT STEP background classes only
++    - InsmIoU = mean IoU over CURRENT STEP instance classes only
++    - Also reports grouped mIoU: Base/New/Old/Novel using global->compact mapping
++    """
+ 
++    def __init__(self, num_classes, ignore_index=255, meta_info=None):
++        super().__init__()
++        self.num_classes = int(num_classes)
++        self.ignore_index = int(ignore_index)
++        self.meta_info = meta_info or {}
++
++        for metric in ("tp_sc", "fp_sc", "fn_sc"):
++            self.add_state(metric, torch.tensor(0, dtype=torch.long), dist_reduce_fx="sum")
++        for metric in ("tps_ssc", "fps_ssc", "fns_ssc"):
++            self.add_state(metric, torch.zeros(self.num_classes, dtype=torch.long), dist_reduce_fx="sum")
++
++        self.ins_indices = []
++        self.bk_indices = []
++        self.seen_indices = []
++
++    # --------------------------------------------------
++    # Helpers
++    # --------------------------------------------------
++    @staticmethod
++    def _safe_mean(x: torch.Tensor):
++        return x.mean() if x.numel() > 0 else torch.tensor(0.0, device=x.device)
++
++    @staticmethod
++    def _to_int_list(x):
++        if x is None:
++            return []
++        if torch.is_tensor(x):
++            return [int(v) for v in x.detach().cpu().flatten().tolist()]
++        if isinstance(x, (list, tuple)):
++            return [int(v) for v in x]
++        return [int(v) for v in list(x)]
++
++    @staticmethod
++    def _filter_valid(ids, C, exclude_zero=True):
++        out = []
++        for i in ids:
++            if exclude_zero and i == 0:
++                continue
++            if 0 <= i < C:
++                out.append(int(i))
++        return sorted(list(dict.fromkeys(out)))
++
++    def _global_to_compact_ids(self, global_ids):
++        """
++        Convert global class ids -> seen-compact ids:
++          0 = background
++          1..K = seen_global_classes in sorted order
++        """
++        seen_global = self._to_int_list(self.meta_info.get("seen_global_classes", []))
++        mapping = {g: i + 1 for i, g in enumerate(seen_global)}
++
++        out = []
++        for g in self._to_int_list(global_ids):
++            if g in mapping:
++                out.append(mapping[g])
++
++        return sorted(list(dict.fromkeys(out)))
++
++    # --------------------------------------------------
++    # Update
++    # --------------------------------------------------
+     def update(self, preds, target):
+-        preds = torch.argmax(preds['ssc_logits'], dim=1)
+-        self.ins_indices = target['ins_cls_info']['indices'].squeeze(0).cpu().numpy().tolist()[1:]
+-        self.bk_indices = target['bk_cls_info']['indices'].squeeze(0).cpu().numpy().tolist()[1:]
+-        target = target['target']
+-        mask = target != self.ignore_index
++        logits = preds["ssc_logits"]  # (B, C, L, W, H) or similar
++        pred_lbl = torch.argmax(logits, dim=1)
+ 
+-        tp, fp, fn = self._calculate_sc_scores(preds, target, mask)
++        # Prefer seen-compact target
++        if "target_seen_compact" in target:
++            y = target["target_seen_compact"]
++        elif "target_compact" in target:
++            y = target["target_compact"]
++        else:
++            y = target["target"]
++            
++        if not hasattr(self, "_debug_metric_printed"):
++            print("\n========== METRIC DEBUG ==========")
++            print("metric num_classes:", self.num_classes)
++            print("logits shape:", tuple(logits.shape))
++            print("target shape:", tuple(y.shape))
++            print("target unique:", torch.unique(y).detach().cpu().tolist()[:50])
++            print("meta seen_global_classes:", self.meta_info.get("seen_global_classes", None))
++            print("meta cur_global_classes:", self.meta_info.get("cur_global_classes", None))
++            print("==================================\n")
++            self._debug_metric_printed = True
++
++        ignore_index = int(target.get("ignore_index", self.ignore_index))
++        mask = (y != ignore_index)
++
++        if logits.shape[1] != self.num_classes:
++            raise ValueError(f"Logits C={logits.shape[1]} but metric num_classes={self.num_classes}")
++
++        # --------------------------------------------------
++        # Build STEP-restricted indices in compact space
++        # --------------------------------------------------
++        empty_label = int(self.meta_info.get("empty_label", 0))
++
++        cur_global = self.meta_info.get("cur_global_classes", [])
++        seen_global = self.meta_info.get("seen_global_classes", [])
++        self.seen_indices = self._global_to_compact_ids(seen_global)
++
++        ins_global_all = self._to_int_list(self.meta_info.get("ins_cls_info", {}).get("indices", []))
++        bk_global_all = self._to_int_list(self.meta_info.get("bk_cls_info", {}).get("indices", []))
++
++        ins_global_all = [g for g in ins_global_all if g != empty_label]
++        bk_global_all = [g for g in bk_global_all if g != empty_label]
++
++        cur_global_set = set(self._to_int_list(cur_global))
++
++        cur_ins_global = sorted([g for g in ins_global_all if g in cur_global_set])
++        cur_bk_global = sorted([g for g in bk_global_all if g in cur_global_set])
++
++        self.ins_indices = self._global_to_compact_ids(cur_ins_global)
++        self.bk_indices = self._global_to_compact_ids(cur_bk_global)
++
++        # --------------------------------------------------
++        # SC
++        # --------------------------------------------------
++        tp, fp, fn = self._calculate_sc_scores(pred_lbl, y, mask, ignore_index)
+         self.tp_sc += tp
+         self.fp_sc += fp
+         self.fn_sc += fn
+ 
+-        tp, fp, fn = self._calculate_ssc_scores(preds, target, mask)
+-        self.tps_ssc += tp
+-        self.fps_ssc += fp
+-        self.fns_ssc += fn
+-
++        # --------------------------------------------------
++        # SSC
++        # --------------------------------------------------
++        tp_c, fp_c, fn_c = self._calculate_ssc_scores(pred_lbl, y, mask, ignore_index)
++        self.tps_ssc += tp_c
++        self.fps_ssc += fp_c
++        self.fns_ssc += fn_c
++
++    # --------------------------------------------------
++    # Compute
++    # --------------------------------------------------
+     def compute(self):
++        # SC
+         if self.tp_sc != 0:
+-            precision = self.tp_sc / (self.tp_sc + self.fp_sc)
+-            recall = self.tp_sc / (self.tp_sc + self.fn_sc)
+-            iou = self.tp_sc / (self.tp_sc + self.fp_sc + self.fn_sc)
++            precision = self.tp_sc / (self.tp_sc + self.fp_sc + 1e-6)
++            recall = self.tp_sc / (self.tp_sc + self.fn_sc + 1e-6)
++            iou_sc = self.tp_sc / (self.tp_sc + self.fp_sc + self.fn_sc + 1e-6)
+         else:
+-            precision, recall, iou = 0, 0, 0
++            precision = torch.tensor(0.0, device=self.tp_sc.device)
++            recall = torch.tensor(0.0, device=self.tp_sc.device)
++            iou_sc = torch.tensor(0.0, device=self.tp_sc.device)
++
++        # Per-class IoU in compact space
+         ious = self.tps_ssc / (self.tps_ssc + self.fps_ssc + self.fns_ssc + 1e-6)
+-        return {
+-            'Precision': precision,
+-            'Recall': recall,
+-            'IoU': iou,
+-            'iou_per_class': ious,
+-            'mIoU': ious[1:].mean(),
+-            'InsmIoU': ious[self.ins_indices].mean(),
+-            'BkmIoU': ious[self.bk_indices].mean(),
++        C = int(ious.numel())
++
++        # --------------------------------------------------
++        # mIoU: cumulative over all classes seen so far (compact space)
++        # --------------------------------------------------
++        seen_ids = self._filter_valid(self.seen_indices, C, exclude_zero=True)
++        miou = self._safe_mean(ious[seen_ids]) if len(seen_ids) else torch.tensor(0.0, device=ious.device)
++
++        ins_ids = self._filter_valid(self.ins_indices, C, exclude_zero=True)
++        bk_ids = self._filter_valid(self.bk_indices, C, exclude_zero=True)
++
++        ins_miou = self._safe_mean(ious[ins_ids]) if len(ins_ids) else torch.tensor(0.0, device=ious.device)
++        bk_miou = self._safe_mean(ious[bk_ids]) if len(bk_ids) else torch.tensor(0.0, device=ious.device)
++
++        # --------------------------------------------------
++        # Grouped metrics via global->compact mapping
++        # --------------------------------------------------
++        def mean_group(key):
++            ids = self._global_to_compact_ids(self.meta_info.get(key, []))
++            ids = self._filter_valid(ids, C, exclude_zero=True)
++            return self._safe_mean(ious[ids]) if len(ids) else torch.tensor(0.0, device=ious.device)
++
++        results = {
++            "Precision": precision,
++            "Recall": recall,
++            "IoU": iou_sc,
++            "iou_per_class": ious,
++
++            # current-step metrics
++            "mIoU": miou,
++            "InsmIoU": ins_miou,
++            "BkmIoU": bk_miou,
++
++            # grouped metrics
++            "Base_mIoU": mean_group("base_global_classes"),
++            "New_mIoU": mean_group("new_global_classes"),
++            "Old_mIoU": mean_group("old_global_classes"),
++            "Novel_mIoU": mean_group("novel_global_classes"),
+         }
+ 
+-    def _calculate_sc_scores(self, preds, targets, nonempty=None):
++        return results
++
++    # --------------------------------------------------
++    # SC scores
++    # --------------------------------------------------
++    @staticmethod
++    def _calculate_sc_scores(preds, targets, nonempty_mask, ignore_index):
+         preds = preds.clone()
+         targets = targets.clone()
+-        bs = preds.shape[0]
+ 
+-        mask = targets == self.ignore_index
+-        preds[mask] = 0
+-        targets[mask] = 0
++        mask_ignore = (targets == ignore_index)
++        preds[mask_ignore] = 0
++        targets[mask_ignore] = 0
+ 
+         preds = preds.flatten(1)
+         targets = targets.flatten(1)
+-        preds = torch.where(preds > 0, 1, 0)
+-        targets = torch.where(targets > 0, 1, 0)
+ 
+-        tp, fp, fn = 0, 0, 0
+-        for i in range(bs):
+-            pred = preds[i]
+-            target = targets[i]
+-            if nonempty is not None:
+-                nonempty_ = nonempty[i].flatten()
+-                pred = pred[nonempty_]
+-                target = target[nonempty_]
+-            pred = pred.bool()
+-            target = target.bool()
+-
+-            tp += torch.logical_and(pred, target).sum()
+-            fp += torch.logical_and(pred, ~target).sum()
+-            fn += torch.logical_and(~pred, target).sum()
++        preds = (preds > 0)
++        targets = (targets > 0)
++
++        tp = torch.logical_and(preds, targets).sum()
++        fp = torch.logical_and(preds, ~targets).sum()
++        fn = torch.logical_and(~preds, targets).sum()
++
+         return tp, fp, fn
+ 
+-    def _calculate_ssc_scores(self, preds, targets, nonempty=None):
++    # --------------------------------------------------
++    # SSC scores
++    # --------------------------------------------------
++    def _calculate_ssc_scores(self, preds, targets, nonempty_mask, ignore_index):
+         preds = preds.clone()
+         targets = targets.clone()
+-        bs = preds.shape[0]
+         C = self.num_classes
+ 
+-        mask = targets == self.ignore_index
+-        preds[mask] = 0
+-        targets[mask] = 0
++        mask_ignore = (targets == ignore_index)
++        preds[mask_ignore] = 0
++        targets[mask_ignore] = 0
+ 
+         preds = preds.flatten(1)
+         targets = targets.flatten(1)
+ 
+-        tp = torch.zeros(C, dtype=torch.int).to(preds.device)
+-        fp = torch.zeros(C, dtype=torch.int).to(preds.device)
+-        fn = torch.zeros(C, dtype=torch.int).to(preds.device)
+-        for i in range(bs):
+-            pred = preds[i]
+-            target = targets[i]
+-            if nonempty is not None:
+-                mask = nonempty[i].flatten() & (target != self.ignore_index)
+-                pred = pred[mask]
+-                target = target[mask]
+-            for c in range(C):
+-                tp[c] += torch.logical_and(pred == c, target == c).sum()
+-                fp[c] += torch.logical_and(pred == c, ~(target == c)).sum()
+-                fn[c] += torch.logical_and(~(pred == c), target == c).sum()
+-        return tp, fp, fn
++        tp = torch.zeros(C, dtype=torch.long, device=preds.device)
++        fp = torch.zeros(C, dtype=torch.long, device=preds.device)
++        fn = torch.zeros(C, dtype=torch.long, device=preds.device)
++
++        for c in range(C):
++            tp[c] += torch.logical_and(preds == c, targets == c).sum()
++            fp[c] += torch.logical_and(preds == c, targets != c).sum()
++            fn[c] += torch.logical_and(preds != c, targets == c).sum()
++
++        return tp, fp, fn
+\ No newline at end of file

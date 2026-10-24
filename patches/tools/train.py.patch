@@ -1,0 +1,75 @@
+--- a/tools/train.py
++++ b/tools/train.py
+@@ -6,9 +6,14 @@
+ import hydra
+ import lightning as L
+ from omegaconf import DictConfig, OmegaConf
++import lightning.pytorch as pl
++from ssc_ia import LitModule, build_data_loaders, pre_build_callbacks, SetSeed
+ 
+ 
+-from ssc_ia import LitModule, build_data_loaders, pre_build_callbacks, SetSeed
++torch.backends.cudnn.benchmark = False
++torch.backends.cudnn.deterministic = False
++torch.backends.cuda.matmul.allow_tf32 = True
++torch.backends.cudnn.allow_tf32 = True
+ 
+ 
+ @hydra.main(config_path='../configs', config_name='config_sema', version_base=None)  # my_config
+@@ -18,15 +23,53 @@
+     
+     if os.environ.get('LOCAL_RANK', 0) == 0:
+         print(OmegaConf.to_yaml(cfg))
+-    
++
++    # The autograd thread creates its own cuBLAS handle on the first backward. By then
++    # the forward pass has filled the 12GB cards and the handle allocation can fail
++    # (CUBLAS_STATUS_ALLOC_FAILED), so create it now while the GPU is empty.
++    if torch.cuda.is_available():
++        local_rank = int(os.environ.get('LOCAL_RANK', 0))
++        warm = torch.ones(8, 8, device=f'cuda:{local_rank % torch.cuda.device_count()}', requires_grad=True)
++        (warm @ warm).sum().backward()
++        del warm
++
+     SetSeed(seed=42)
+     cfg, callbacks = pre_build_callbacks(cfg)
+ 
+-    dls, meta_info = build_data_loaders(cfg.data)
++    # Forward root-level pseudo config into cfg.data so build_data_loaders
++    # can pass it to the dataset constructor.  cfg.data is struct-mode so we
++    # copy it and drop struct before adding the key.
++    _data_cfg = cfg.data.copy()
++    OmegaConf.set_struct(_data_cfg, False)
++    if "pseudo" in cfg:
++        _data_cfg.pseudo = cfg.pseudo
++    dls, meta_info = build_data_loaders(_data_cfg)
++    print("[DEBUG] len(dls) =", len(dls))
++    if len(dls) == 0:
++        raise RuntimeError(f"No dataloaders built. cfg.data.datasets.splits={cfg.data.datasets.splits}")
++    meta_info.pop("pseudo", None)  # already in **cfg; remove to avoid duplicate kwarg
+     model = LitModule(**cfg, **meta_info)
+     trainer = L.Trainer(**cfg.trainer, **callbacks)
+     ckpt_path = None if cfg.resume.ckpt_path=='None' else cfg.resume.ckpt_path
+-    trainer.fit(model, *dls[:2], ckpt_path=ckpt_path)
++
++    train_dl = dls[0]
++    val_dl = dls[1] if len(dls) > 1 else None
++
++    class _DM(pl.LightningDataModule):
++        def __init__(self, train_dl, val_dl=None):
++            super().__init__()
++            self._train_dl = train_dl
++            self._val_dl = val_dl
++
++        def train_dataloader(self):
++            return self._train_dl
++
++        def val_dataloader(self):
++            return self._val_dl
++
++    dm = _DM(train_dl, val_dl)
++
++    trainer.fit(model, datamodule=dm, ckpt_path=ckpt_path)
+ 
+ 
+ if __name__ == '__main__':

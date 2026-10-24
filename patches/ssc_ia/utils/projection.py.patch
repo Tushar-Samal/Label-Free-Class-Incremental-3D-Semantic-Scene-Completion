@@ -1,0 +1,506 @@
+--- a/ssc_ia/utils/projection.py
++++ b/ssc_ia/utils/projection.py
+@@ -8,249 +8,348 @@
+ 
+ from ..models.utils.utils import pix2vox, generate_grid
+ 
++# -----------------------------------------------------------------------------
++# Helper utilities (CIL-safe)
++# -----------------------------------------------------------------------------
++def _get_voxel_target(target):
++    """
++    DISC expects voxel GT either as:
++      - dict with key 'target' (torch tensor or numpy array)
++      - raw numpy array / torch tensor (L, W, H)
++    Returns voxel_data as a torch.Tensor (L, W, H).
++    """
++    if isinstance(target, dict):
++        voxel = target.get("target", None)
++        if voxel is None:
++            raise KeyError(
++                f"target dict has no 'target' key. Available keys: {list(target.keys())}"
++            )
++    else:
++        voxel = target
++
++    if isinstance(voxel, np.ndarray):
++        voxel = torch.from_numpy(voxel)
++    elif not torch.is_tensor(voxel):
++        raise TypeError(f"Unsupported voxel target type: {type(voxel)}")
++    return voxel.long()
++
++
++def _get_ignore_index(target, default=255):
++    if isinstance(target, dict):
++        if "ignore_index" in target:
++            return int(target["ignore_index"])
++        if "ignore_label" in target:
++            return int(target["ignore_label"])
++    return int(default)
++
++
++def _get_empty_label(target, default=0):
++    if isinstance(target, dict) and "empty_label" in target:
++        return int(target["empty_label"])
++    return int(default)
++
++
++def _get_voxel_target_for_projection(target):
++    """
++    For projection/aux GT generation, prefer compact target when available.
++    - If disjoint CIL: use target_compact (compact label space)
++    - Else: use target (global label space)
++    """
++    if isinstance(target, dict) and ("target_compact" in target):
++        voxel = target["target_compact"]
++        if isinstance(voxel, np.ndarray):
++            voxel = torch.from_numpy(voxel)
++        elif not torch.is_tensor(voxel):
++            raise TypeError(f"Unsupported target_compact type: {type(voxel)}")
++        return voxel.long()
++    return _get_voxel_target(target)
++
++
++def _get_step_indices(target, mode: str):
++    """
++    Returns indices for 'bk' or 'ins'.
++    - If disjoint CIL compact indices exist: use them (cil_*_indices)
++    - Else: use global indices from bk_cls_info / ins_cls_info
++    """
++    assert mode in ("bk", "ins")
++
++    key = "cil_bk_indices" if mode == "bk" else "cil_ins_indices"
++    if isinstance(target, dict) and (key in target):
++        idx = target[key]
++        if torch.is_tensor(idx):
++            idx = idx.squeeze(0).detach().cpu().numpy()
++        else:
++            idx = np.asarray(idx).squeeze(0)
++        return idx.astype(np.int64)
++
++    if mode == "bk":
++        idx = target["bk_cls_info"]["indices"][1:]
++    else:
++        idx = target["ins_cls_info"]["indices"][1:]
++
++    if torch.is_tensor(idx):
++        idx = idx.detach().cpu().numpy()
++    return np.asarray(idx, dtype=np.int64)
++
++
++# -----------------------------------------------------------------------------
++# Colors
++# -----------------------------------------------------------------------------
+ COLORS = np.array([
+-    [255, 255, 255, 255], #custom add for empty pixel
++    [255, 255, 255, 255],  # empty
+     [100, 150, 245, 255],
+     [100, 230, 245, 255],
+     [30, 60, 150, 255],
+     [80, 30, 180, 255],
+     [100, 80, 250, 255],
+-    [255, 30, 30, 255], #person
++    [255, 30, 30, 255],    # person
+     [255, 40, 200, 255],
+     [150, 30, 90, 255],
+-    [255, 0, 255, 255], # road
+-    [255, 150, 255, 255], # parking
+-    [75, 0, 75, 255], # sidewalk
+-    [175, 0, 75, 255], # other-ground
+-    [255, 200, 0, 255], #building
++    [255, 0, 255, 255],    # road
++    [255, 150, 255, 255],  # parking
++    [75, 0, 75, 255],      # sidewalk
++    [175, 0, 75, 255],     # other-ground
++    [255, 200, 0, 255],    # building
+     [255, 120, 50, 255],
+-    [0, 175, 0, 255], #vegetation
++    [0, 175, 0, 255],      # vegetation
+     [135, 60, 0, 255],
+-    [150, 240, 80, 255], #terrain
++    [150, 240, 80, 255],   # terrain
+     [255, 240, 150, 255],
+     [255, 0, 0, 255],
+-    [100, 100, 50, 255], # custom add for out-of-scene pixels
++    [100, 100, 50, 255],   # out-of-scene
+ ]).astype(np.uint8)
+ 
+ 
+-
++# -----------------------------------------------------------------------------
++# Projection functions
++# -----------------------------------------------------------------------------
+ def project_voxels_to_image(data_input, target, save=False):
+     """Project voxel gt to front image in order to get semantic seg gt in front image
+-    
+     Args:
+         data_input: Original input data
+         target: Original target data
+-        save: Save visiable seg image
++        save: Save visible seg image
+     Return:
+-        semantic_target: torch.tensor in shape of (b, *image_shape)
++        semantic_target: torch.tensor in shape of (n_bk_cls, img_h, img_w) one-hot-ish masks
+     """
+-    bk_indices = target['bk_cls_info']['indices'][1:]
+-    scale = data_input['scale_3ds'][0]
+-    projected_pix_coor = data_input[f'projected_pix_{scale}'].squeeze() #(n_voxels, 2)
+-    pix_z_coor = data_input[f'pix_z_{scale}'].squeeze() #(n_voxels)
+-    fov_mask = data_input[f'fov_mask_{scale}'].squeeze() #(n_voxels)
+-    image_shape = data_input['img'].shape[-2:] # (img_h, img_w)
+-    voxel_data = target['target'].squeeze().reshape(-1) #(vl, vw, vh)
++    bk_indices = _get_step_indices(target, mode="bk")
++    ignore_index = _get_ignore_index(target, 255)
++    empty_label = _get_empty_label(target, 0)
++
++    scale = data_input["scale_3ds"][0]
++    projected_pix_coor = data_input[f"projected_pix_{scale}"].squeeze()  # (n_voxels, 2)
++    pix_z_coor = data_input[f"pix_z_{scale}"].squeeze()                  # (n_voxels)
++    fov_mask = data_input[f"fov_mask_{scale}"].squeeze()                 # (n_voxels)
++    image_shape = data_input["img"].shape[-2:]                           # (img_h, img_w)
++
++    voxel_data = _get_voxel_target_for_projection(target).squeeze().reshape(-1)
+ 
+-    # init semantic image
+     semantic_image = np.zeros(image_shape, dtype=np.int32)
+     depth_image = np.zeros(image_shape, dtype=np.float32)
+ 
+-    # filter voxels outside image
+-    pixel_x = projected_pix_coor[fov_mask][:, 0] # n_voxels_fov
+-    pixel_y = projected_pix_coor[fov_mask][:, 1] # n_voxels_fov
+-    depth_values = pix_z_coor[fov_mask] # n_voxels_fov
++    pixel_xy = projected_pix_coor[fov_mask]  # (n_voxels_fov, 2)
++    pixel_x = pixel_xy[:, 0]
++    pixel_y = pixel_xy[:, 1]
++    depth_values = pix_z_coor[fov_mask]
+     indices = torch.nonzero(fov_mask, as_tuple=False).squeeze()
+-    
+-    # Iterate over each voxel
++
+     for i in range(len(pixel_x)):
+-        x, y = pixel_x[i], pixel_y[i]
+-        vol_indic = indices[i]
+-        if voxel_data[vol_indic] != 0 and voxel_data[vol_indic] != 255:  # non-empty
+-            if semantic_image[y, x] == 0 or depth_values[i] < depth_image[y, x]:  # use depth to choose ultimate pixel label
+-                semantic_image[y, x] = voxel_data[vol_indic]
+-                depth_image[y, x] = depth_values[i]
+-    
++        x = int(pixel_x[i].item()) if torch.is_tensor(pixel_x[i]) else int(pixel_x[i])
++        y = int(pixel_y[i].item()) if torch.is_tensor(pixel_y[i]) else int(pixel_y[i])
++        vol_indic = int(indices[i].item()) if torch.is_tensor(indices[i]) else int(indices[i])
++
++        v = int(voxel_data[vol_indic].item()) if torch.is_tensor(voxel_data[vol_indic]) else int(voxel_data[vol_indic])
++        if v != empty_label and v != ignore_index:
++            d = float(depth_values[i].item()) if torch.is_tensor(depth_values[i]) else float(depth_values[i])
++            if semantic_image[y, x] == empty_label or d < depth_image[y, x]:
++                semantic_image[y, x] = v
++                depth_image[y, x] = d
++
+     if save:
+         save_visable_results(semantic_image, data_input)
+-    # get bk semantic map
+-    semantic_image = torch.from_numpy(semantic_image)
+-    return torch.cat([(semantic_image==i).to(torch.int32).unsqueeze(0) for i in bk_indices], dim=0)
+-
+-def project_image_to_voxels(data_input, target, image_scale=1, mode='ins', save=False):
+-    """Project image to voxels to get finer-grained segmentation gt
+-    
+-    Args:
+-        data_input: Original input data
+-        target: Original target data
+-        mode: 'ins' for instance seg map, 'bk' for bksetg map.
+-        save: Save visiable seg image
+-    Return:
+-        semantic_target: torch.tensor in shape of (b, *image_shape)
++
++    semantic_image_t = torch.from_numpy(semantic_image)
++    return torch.cat([(semantic_image_t == i).to(torch.int32).unsqueeze(0) for i in bk_indices], dim=0)
++
++
++def project_image_to_voxels(data_input, target, image_scale=1, mode="ins", save=False):
++    """Project image to voxels to get finer-grained segmentation gt.
++    Works for both:
++      - global labels (standard training)
++      - compact labels (disjoint CIL) when dataset provides target_compact + cil_*_indices
+     """
+-    ins_indices = target['ins_cls_info']['indices'][1:]
+-    bk_indices = target['bk_cls_info']['indices'][1:]
+-    num_cls = len(ins_indices) + len(bk_indices) + 1
+-    # get useful data information from dataloader
+-    image_shape = data_input['img'].shape[-2:] # (img_h, img_w)
+-    depth = data_input['depth'].unsqueeze(0)# (bs, img_h, img_w)
+-    cam_K = data_input['cam_K'].unsqueeze(0) #(bs, 3, 3)
+-    cam_E = data_input['cam_pose'].unsqueeze(0) # (bs, 4, 4)
+-    voxel_origin = data_input['voxel_origin'].unsqueeze(0) #(bs, 3)
+-    voxel_data = target['target'].squeeze() #(vl, vw, vh)
+-    voxel_scale = data_input['scale_3ds'][0]
++    assert mode in ("ins", "bk")
++
++    ins_indices = _get_step_indices(target, mode="ins")
++    bk_indices = _get_step_indices(target, mode="bk")
++
++    ignore_index = _get_ignore_index(target, 255)
++    empty_label = _get_empty_label(target, 0)
++
++    # Sentinel for "out-of-scene" pixels: choose next id beyond all valid ids in current label space
++    max_id = int(max([empty_label] + ins_indices.tolist() + bk_indices.tolist()))
++    num_cls = max_id + 1
++
++    image_shape = data_input["img"].shape[-2:]  # (img_h, img_w)
++    depth = data_input["depth"].unsqueeze(0)    # (1, img_h, img_w)
++    cam_K = data_input["cam_K"].unsqueeze(0)    # (1, 3, 3)
++    cam_E = data_input["cam_pose"].unsqueeze(0) # (1, 4, 4)
++    voxel_origin = data_input["voxel_origin"].unsqueeze(0)  # (1, 3)
++
++    voxel_data = _get_voxel_target_for_projection(target).squeeze()
++    voxel_scale = data_input["scale_3ds"][0]
+ 
+-    # Generate intermediate variables
+     image_grid = generate_grid(image_shape)
+-    image_grid = torch.flip(image_grid, dims=[0]).unsqueeze(0)  # (1, 2, img_h, img_w)      
++    image_grid = torch.flip(image_grid, dims=[0]).unsqueeze(0)  # (1, 2, img_h, img_w)
+ 
+-    #NOTE: About 20% of the pixels are outside the 3D scene range
+     vol_pts = pix2vox(
+-        image_grid*image_scale,
++        image_grid * image_scale,
+         depth.unsqueeze(1),
+         cam_K,
+         cam_E,
+         voxel_origin,
+-        post_rot=data_input['post_rot'].unsqueeze(0), # (1, 3, 3)
+-        post_tran=data_input['post_tran'].unsqueeze(0), #(1, 3)
+-        vox_size=0.2*voxel_scale,  # voxel size
+-        downsample_z=1).squeeze().long()     # (370*1220, 3)
++        post_rot=data_input["post_rot"].unsqueeze(0),
++        post_tran=data_input["post_tran"].unsqueeze(0),
++        vox_size=0.2 * voxel_scale,
++        downsample_z=1,
++    ).squeeze().long()  # (img_h*img_w, 3)
++
++    # Flatten voxel data and add sentinel (num_cls) at the end
++    extended_voxel_data = torch.cat((voxel_data.flatten(), torch.tensor([num_cls], device=voxel_data.device)), 0)
+ 
+-    # Flatten voxel_data for easier indexing
+-    extended_voxel_data = torch.cat((voxel_data.flatten(), torch.tensor([num_cls])), 0)
+     dim1, dim2, dim3 = voxel_data.shape
+-    # Convert 3D indices to 1D linear indices
++
+     linear_indices = vol_pts[..., 0] * dim2 * dim3 + vol_pts[..., 1] * dim3 + vol_pts[..., 2]
+     linear_indices = torch.where(
+-        (vol_pts[..., 0] >= dim1) | (vol_pts[..., 1] >= dim2) | (vol_pts[..., 2] >= dim3),
+-        torch.tensor(extended_voxel_data.size(0) - 1), 
++        (vol_pts[..., 0] >= dim1) | (vol_pts[..., 1] >= dim2) | (vol_pts[..., 2] >= dim3) |
++        (vol_pts[..., 0] < 0) | (vol_pts[..., 1] < 0) | (vol_pts[..., 2] < 0),
++        torch.tensor(extended_voxel_data.size(0) - 1, device=linear_indices.device),
+         linear_indices
+     )
+-    # Map linear indices to class labels using extended voxel data
++
+     semantic_map_flat = extended_voxel_data[linear_indices]
++    semantic_image = semantic_map_flat.view(image_shape[0], image_shape[1]).long().cpu().numpy()
++
++    # turn ignore_index into sentinel so we can mask cleanly
++    semantic_image[semantic_image == ignore_index] = num_cls
+ 
+-    # Reshape to get the semantic segmentation labels map
+-    semantic_image = semantic_map_flat.view(image_shape[0], image_shape[1]).long().numpy()
+-    semantic_image[semantic_image == 255] = num_cls
+-
+-    # generate seg gt of specific clses
+-    # semantic_image = torch.from_numpy(semantic_image)
+-    indices = np.concatenate((ins_indices, [num_cls])) if mode=='ins' else np.concatenate((bk_indices, [num_cls]))
++    indices = np.concatenate((ins_indices, [num_cls])) if mode == "ins" else np.concatenate((bk_indices, [num_cls]))
+     mask = np.isin(semantic_image, indices)
+     semantic_image_renew = np.where(mask, semantic_image, 0)
+-    
++
+     if save:
+-        save_visable_results(semantic_image, data_input, specfic_id='complete')
+-        save_visable_results(semantic_image_renew, data_input, specfic_id='partial')
+-    semantic_image_renew[semantic_image == num_cls] = 255  # NOTE: KEEP 255
++        save_visable_results(semantic_image, data_input, specfic_id="complete")
++        save_visable_results(semantic_image_renew, data_input, specfic_id="partial")
++
++    # restore ignore index
++    semantic_image_renew[semantic_image == num_cls] = ignore_index
+     return semantic_image_renew
+-    # return torch.cat([(semantic_image==i).to(torch.int32).unsqueeze(0) for i in bk_indices], dim=0)
+ 
+ 
+ def instance_bev_seg_map(data_input, target, save=False):
+-    """Generate instance seg map for assign loss
+-    """
+-    ins_indices = target['ins_cls_info']['indices'][1:]
+-    bk_indices = target['bk_cls_info']['indices'][1:]
++    """Generate instance seg map for assign loss."""
++    ins_indices = _get_step_indices(target, mode="ins")
+ 
+-    # bev_remap = project_voxels_to_single_bev(data_input, target, save=save, mode='ins')
+-    seg_maps = project_voxels_to_bev(data_input, target, save=save, mode='ins').numpy() #(H, W)
++    seg_maps = project_voxels_to_bev(data_input, target, save=save, mode="ins").numpy()
+     instance_list = []
+-    
+-    # Iterate over all classes except the background (0)
++
+     for class_id, class_mask in zip(ins_indices, seg_maps):
+-        map_id = ins_indices.index(class_id) + 1 
+-        # # Create binary mask for the current class
+-        # class_mask = (seg_map == class_id)
+-        
+-        # If there are no pixels for this class, continue to the next class
++        # NOTE: here, label is "index in ins_indices + 1" (kept as original behavior)
++        map_id = ins_indices.tolist().index(int(class_id)) + 1
++
+         if np.sum(class_mask) == 0:
+             continue
+-        
+-        # Label connected components in the binary mask
++
+         labeled_mask, num_instances = label(class_mask)
+-        
+-        # Create instance masks and store them in the output list
++
+         for instance_id in range(1, num_instances + 1):
+             instance_mask = (labeled_mask == instance_id)
+-            instance_list.append({
+-                'label': map_id,
+-                'mask': instance_mask
+-            })
+-    
++            instance_list.append({"label": map_id, "mask": instance_mask})
++
+     if save:
+         for i, ins in enumerate(instance_list):
+-            ins_label = ins_indices[ins['label'] - 1]
+-            mask = ins['mask'] * ins_label
+-            specfic_id = f'ins_{i}_{ins_label}'
++            ins_label = ins_indices[ins["label"] - 1]
++            mask = ins["mask"] * ins_label
++            specfic_id = f"ins_{i}_{ins_label}"
+             save_visable_results(mask, data_input, specfic_id=specfic_id)
+ 
+     return instance_list
+ 
+ 
+-def project_voxels_to_bev(data_input, target, save=False, mode='bk'):
++def project_voxels_to_bev(data_input, target, save=False, mode="bk"):
+     """
+-    Generate BEV semantic segmentation masks for each class from the 3D semantic segmentation target
+-    NOTE: This function does not consider the occlusion caused by the viewing angle from top to bottom.
++    Generate BEV semantic segmentation masks for each class from the 3D semantic segmentation target.
++    NOTE: This function does not consider occlusion (top-down overwrite).
+     """
+-    ins_indices = target['ins_cls_info']['indices'][1:]
+-    bk_indices = target['bk_cls_info']['indices'][1:]
+-    ins_names = target['ins_cls_info']['names'][1:]
+-    bk_names = target['bk_cls_info']['names'][1:]
+-
+-    indices = bk_indices if mode=='bk' else ins_indices
+-    names = bk_names if mode=='bk' else ins_names
+-    voxel_data = target['target'] #(vl, vw, vh)
+-    masks = [torch.max(voxel_data==i, axis=2).values.to(torch.int32).unsqueeze(0) for i in indices]
++    assert mode in ("bk", "ins")
++
++    ins_indices = _get_step_indices(target, mode="ins")
++    bk_indices = _get_step_indices(target, mode="bk")
++
++    # Names are only used for saving visuals; keep fallback to global names if not CIL
++    ins_names = target["ins_cls_info"]["names"][1:] if ("ins_cls_info" in target) else [f"ins_{i}" for i in ins_indices]
++    bk_names = target["bk_cls_info"]["names"][1:] if ("bk_cls_info" in target) else [f"bk_{i}" for i in bk_indices]
++
++    indices = bk_indices if mode == "bk" else ins_indices
++    names = bk_names if mode == "bk" else ins_names
++
++    voxel_data = _get_voxel_target_for_projection(target)
++    masks = [torch.max(voxel_data == int(i), axis=2).values.to(torch.int32).unsqueeze(0) for i in indices]
++
+     if save:
+         for i, mask in enumerate(masks):
+-            mask = torch.where(mask.squeeze().bool(), indices[i], 0).numpy()
+-            if mask.sum() != 0:
+-                save_visable_results(mask, data_input, specfic_id=names[i])
++            cls_id = int(indices[i])
++            mask_vis = torch.where(mask.squeeze().bool(), cls_id, 0).cpu().numpy()
++            if mask_vis.sum() != 0:
++                # names list might not align in compact case; guard index
++                nm = names[i] if i < len(names) else f"cls_{cls_id}"
++                save_visable_results(mask_vis, data_input, specfic_id=nm)
++
+     return torch.cat(masks, dim=0)
+ 
+ 
+-def project_voxels_to_single_bev(data_input, target, save=False, mode='bk'):
+-    ins_indices = target['ins_cls_info']['indices'][1:]
+-    bk_indices = target['bk_cls_info']['indices'][1:]
+-    voxel_data = target['target'] # (256, 256, 32)
++def project_voxels_to_single_bev(data_input, target, save=False, mode="bk"):
++    """
++    Returns a single BEV label map (L, W) with labels in the same space as voxel GT.
++    Then remaps labels to 0..N where N=len(indices), keeping 0 as background.
++    """
++    assert mode in ("bk", "ins")
++
++    ins_indices = _get_step_indices(target, mode="ins")
++    bk_indices = _get_step_indices(target, mode="bk")
++    indices = bk_indices if mode == "bk" else ins_indices
++
++    voxel_data = _get_voxel_target_for_projection(target).cpu().numpy()
+     L, W, H = voxel_data.shape
+-    indices = bk_indices if mode=='bk' else ins_indices
+-    # Initialize the BEV map
++
+     bev_map = np.zeros((L, W), dtype=np.uint8)
+-    for h in range(0, H-1):
+-        # Extract the current layer
++    for h in range(0, H - 1):
+         layer = voxel_data[:, :, h]
+         mask = np.isin(layer, indices)
+-        
+-        # Update the BEV map where the mask is true (considering occlusion)
+         bev_map[mask] = layer[mask]
+-    
++
+     if save:
+-        save_visable_results(bev_map, data_input, specfic_id='bev')
+-    
+-    # Remap gt labels
+-    bk_indices_ = np.concatenate(([0], indices))   # bug here
+-    indice_remap = {y:x for (x, y) in enumerate(bk_indices_)}
++        save_visable_results(bev_map, data_input, specfic_id="bev")
++
++    # Remap: [0] + indices -> 0..len(indices)
++    idx_list = np.concatenate(([0], indices.astype(np.int64)))
++    indice_remap = {int(y): int(x) for (x, y) in enumerate(idx_list)}
++
+     bev_remap = np.copy(bev_map)
+     for old_label, new_label in indice_remap.items():
+         bev_remap[bev_map == old_label] = new_label
++
+     return bev_remap
+ 
+-def save_visable_results(semantic_image, data_input, data_root='./vis/seg_image/', specfic_id=None):
+-    """Visuliz segmentation gt image
+-    Args:
+-        semantic_image : semantic image label in numpy format
+-    """
+-    frame_id = data_input['frame_id']
+-    sequence = data_input['sequence'] 
+-    segimg_name = frame_id + '.png' if specfic_id==None else frame_id + '_' + str(specfic_id) + '.png'
++
++def save_visable_results(semantic_image, data_input, data_root="./vis/seg_image/", specfic_id=None):
++    """Visualize segmentation gt image."""
++    frame_id = data_input["frame_id"]
++    sequence = data_input["sequence"]
++    segimg_name = frame_id + ".png" if specfic_id is None else frame_id + "_" + str(specfic_id) + ".png"
+     img_path = os.path.join(data_root, *[sequence, segimg_name])
+     os.makedirs(os.path.dirname(img_path), exist_ok=True)
+ 
+-    color_image = np.zeros((semantic_image.shape[0], semantic_image.shape[1], 4), dtype=np.uint8)  # RGBA format
+     color_image = COLORS[semantic_image]
+-    # convert array to PIL image
+-    # color_image = (resize(color_image, (47, 153, 4), anti_aliasing=True)* 255).astype(np.uint8) # NOTE: Temp
+     color_image_pil = Image.fromarray(color_image)
+-    color_image_pil.save(img_path)
+\ No newline at end of file
++    color_image_pil.save(img_path)

@@ -1,0 +1,31 @@
+--- a/ssc_ia/utils/build.py
++++ b/ssc_ia/utils/build.py
+@@ -32,17 +32,19 @@
+         callbacks.LearningRateMonitor(logging_interval='step'),
+         callbacks.ModelCheckpoint(
+             dirpath=logger[0].log_dir,
+-            filename='e{epoch}_miou{val/mIoU:.4f}',
++            filename='best',
+             monitor='val/mIoU',
+             mode='max',
+-            auto_insert_metric_name=False),
+-        callbacks.EarlyStopping(
+-            monitor='val/mIoU',  # Metric to monitor (e.g., validation loss)
+-            min_delta=0.0001,     # Minimum change to qualify as an improvement
+-            patience=4,          # Number of epochs with no improvement after which training will be stopped
+-            verbose=True,        # Verbosity mode
+-            mode='max'           # Mode for the monitored metric ('min' for minimizing loss)
+-        ),
++            auto_insert_metric_name=False,
++            save_last=True,
++            save_top_k=1,),
++        # callbacks.EarlyStopping(
++        #     monitor='val/mIoU',  # Metric to monitor (e.g., validation loss)
++        #     min_delta=0.0001,     # Minimum change to qualify as an improvement
++        #     patience=4,          # Number of epochs with no improvement after which training will be stopped
++        #     verbose=True,        # Verbosity mode
++        #     mode='max'           # Mode for the monitored metric ('min' for minimizing loss)
++        # ),
+         callbacks.ModelSummary(max_depth=3)
+     ]
+ 

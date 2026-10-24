@@ -1,0 +1,12 @@
+{
+  "road": {"compact_id": 1, "prompts": ["road", "roadmarking"]},
+  "sidewalk": {"compact_id": 2, "prompts": ["sidewalk", "walkway"]},
+  "vegetation": {"compact_id": 3, "prompts": ["tree", "bush", "plants"]},
+  "terrain": {"compact_id": 4, "prompts": ["terrain", "grass", "dirt", "sand"]},
+  "fence": {"compact_id": 5, "prompts": ["fence"]},
+  "trunk": {"compact_id": 6, "prompts": ["tree-trunk"]},
+  "pole": {"compact_id": 7, "prompts": ["pole"]},
+  "car": {"compact_id": 8, "prompts": ["car", "sedan", "van"]},
+  "person": {"compact_id": 9, "prompts": ["person", "pedestrian"]},
+  "traffic-sign": {"compact_id": 10, "prompts": ["traffic-sign", "road-sign"]}
+}

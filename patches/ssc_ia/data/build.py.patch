@@ -1,0 +1,290 @@
+--- a/ssc_ia/data/build.py
++++ b/ssc_ia/data/build.py
+@@ -1,21 +1,278 @@
++import sys
+ from omegaconf import DictConfig, ListConfig, OmegaConf
+ from torch.utils.data import DataLoader
++import torch
+ 
+ from .. import build_from_configs
+ from . import datasets
+ 
+ 
++def _splits_to_list(splits):
++    """Allow continual_splits to be list-of-lists or dict {0:[...], 1:[...], ...}."""
++    if splits is None:
++        return None
++
++    if isinstance(splits, DictConfig):
++        splits = dict(splits)
++
++    if isinstance(splits, dict):
++        keys = sorted(list(splits.keys()), key=lambda x: int(x))
++        return [list(splits[k]) for k in keys]
++
++    if isinstance(splits, ListConfig):
++        splits = list(splits)
++
++    return [list(s) for s in splits]
++
++
++def unique_preserve_order(xs):
++    """Deduplicate while preserving first-seen insertion order."""
++    return list(dict.fromkeys(xs))
++
++
++def flatten_splits_preserve_order(splits, start, end):
++    """Concatenate splits[start:end] and deduplicate in insertion order."""
++    out = []
++    for i in range(start, end):
++        out.extend(list(splits[i]))
++    return unique_preserve_order(out)
++
++
++def _get_current_step_classes(continual_splits, continual_step: int):
++    splits = _splits_to_list(continual_splits)
++    assert splits is not None, "continual_splits is required for disjoint CIL"
++    assert 0 <= continual_step < len(splits), (
++        f"continual_step={continual_step} out of range (len={len(splits)})"
++    )
++    return unique_preserve_order(splits[continual_step])
++
++
++def _get_seen_step_classes(continual_splits, continual_step: int):
++    splits = _splits_to_list(continual_splits)
++    assert splits is not None, "continual_splits is required for disjoint CIL"
++    assert 0 <= continual_step < len(splits), (
++        f"continual_step={continual_step} out of range (len={len(splits)})"
++    )
++    return flatten_splits_preserve_order(splits, 0, continual_step + 1)
++
++
++def _get_base_new_old_novel_future(continual_splits, step: int):
++    """
++    Returns global-id class lists preserving DCIL insertion order (no sorting):
++      base   = S0
++      new    = Sk
++      old    = union S0..S{k-1}
++      novel  = S1..Sk
++      future = S{k+1}..S_last
++      seen   = S0..Sk
++    """
++    splits = _splits_to_list(continual_splits)
++    assert splits is not None, "continual_splits is required"
++    assert 0 <= step < len(splits), f"step={step} out of range (len={len(splits)})"
++
++    base = unique_preserve_order(splits[0])
++    new  = unique_preserve_order(splits[step])
++
++    old    = flatten_splits_preserve_order(splits, 0, step)          if step > 0              else []
++    novel  = flatten_splits_preserve_order(splits, 1, step + 1)      if step >= 1             else []
++    future = flatten_splits_preserve_order(splits, step + 1, len(splits)) if step < len(splits) - 1 else []
++    seen   = flatten_splits_preserve_order(splits, 0, step + 1)
++
++    return base, new, old, novel, future, seen
++
++
++def _get_cil_mode(dataset_cfg):
++    cil_mode = getattr(dataset_cfg, "cil_mode", None)
++    if cil_mode is None:
++        cil_mode = getattr(dataset_cfg, "cil_scenario", None)
++    return None if cil_mode is None else str(cil_mode).lower()
++
++
++def compute_disjoint_num_classes_and_weights(dataset_cfg, full_class_weights: torch.Tensor):
++    """
++    Seen-compact label space for pseudo-labeling:
++      0 = background
++      1..K = all seen classes up to current step
++    """
++    cil_mode = _get_cil_mode(dataset_cfg)
++    if cil_mode != "disjoint":
++        return int(full_class_weights.numel()), full_class_weights.float(), None, None
++
++    step = int(getattr(dataset_cfg, "continual_step", 0))
++    splits = _splits_to_list(getattr(dataset_cfg, "continual_splits", None))
++    assert splits is not None, "continual_splits is required for disjoint CIL"
++
++    cur  = unique_preserve_order(splits[step])
++    seen = flatten_splits_preserve_order(splits, 0, step + 1)
++
++    empty_label = int(getattr(dataset_cfg, "empty_label", 0))
++    num_classes = 1 + len(seen)
++
++    w_bg = full_class_weights[empty_label].view(1)
++    w_seen = full_class_weights[torch.tensor(seen, dtype=torch.long)]
++    cil_class_weights = torch.cat([w_bg, w_seen], dim=0).float()
++
++    assert cil_class_weights.numel() == num_classes, (
++        f"cil_class_weights has {cil_class_weights.numel()} but num_classes={num_classes}"
++    )
++
++    return num_classes, cil_class_weights, cur, seen
++
++
+ def build_data_loaders(cfg: DictConfig):
+     cfg = cfg.copy()
+     if isinstance(cfg, DictConfig):
+         OmegaConf.set_struct(cfg, False)
+-    split_cfgs = cfg.datasets.pop('splits')
++
++    split_cfgs = cfg.datasets.pop("splits", None)
++
+     if isinstance(split_cfgs, ListConfig):
+-        split_cfgs = {split: {'split': split} for split in split_cfgs}
++        split_cfgs = {str(split): {"split": str(split)} for split in split_cfgs}
++    elif isinstance(split_cfgs, (list, tuple)):
++        split_cfgs = {str(split): {"split": str(split)} for split in split_cfgs}
++    elif isinstance(split_cfgs, (DictConfig, dict)):
++        split_cfgs = dict(split_cfgs)
++    else:
++        raise ValueError(
++            f"[build_data_loaders] cfg.datasets.splits is missing or invalid: "
++            f"{type(split_cfgs)} -> {split_cfgs}"
++        )
++
++    loaders = []
++    ds_train = None
++
++    for split, cfgs in split_cfgs.items():
++        dataset_kwargs = dict(**cfg.datasets, **cfgs)
++
++        # Important: pass pseudo/render2d into the dataset itself.
++        # Previously pseudo/render2d were only passed to meta, not SemanticKITTI.
++        if "pseudo" in cfg:
++            dataset_kwargs["pseudo"] = cfg.pseudo
++
++        if "render2d" in cfg:
++            dataset_kwargs["render2d"] = cfg.render2d
++
++        ds = build_from_configs(datasets, dataset_kwargs)
++
++        if split == "train":
++            ds_train = ds
++
++        sys.stderr.write(
++            f"[DEBUG] build_data_loaders: split={split} len(ds)={len(ds)} "
++            f"num_classes={getattr(ds, 'num_classes', None)}\n"
++        )
++        sys.stderr.flush()
++
++        if len(ds) == 0:
++            raise ValueError(
++                f"Dataset for split='{split}' is empty (len=0). "
++                f"label_root={getattr(ds,'label_root',None)} project_scale={getattr(ds,'project_scale',None)} "
++                f"output_scale={getattr(ds,'output_scale',None)} sequences={getattr(ds,'sequences',None)}"
++            )
++
++        loaders.append(
++            DataLoader(
++                ds,
++                **cfg.loader,
++                shuffle=(split == "train"),
++            )
++        )
++
++    if len(loaders) == 0:
++        raise ValueError(f"[build_data_loaders] Built 0 dataloaders. splits={split_cfgs}")
++
++    ds_type = getattr(datasets, cfg.datasets.type)
++    meta = dict(ds_type.META_INFO)
++
++    if "class_frequencies" not in meta:
++        raise ValueError(
++            f"{cfg.datasets.type}.META_INFO must contain 'class_frequencies'"
++        )
++
++    if "bk_cls_info" not in meta:
++        raise ValueError(f"{cfg.datasets.type}.META_INFO must contain 'bk_cls_info'")
++
++    if "ins_cls_info" not in meta:
++        raise ValueError(f"{cfg.datasets.type}.META_INFO must contain 'ins_cls_info'")
++
++    ds_cfg = cfg.datasets
++    cil_mode = ds_cfg.get("cil_scenario", ds_cfg.get("cil_mode", None))
++    meta["cil_scenario"] = None if cil_mode is None else str(cil_mode)
++    meta["continual_step"] = int(ds_cfg.get("continual_step", 0))
++    meta["continual_splits"] = OmegaConf.to_container(
++        ds_cfg.get("continual_splits", None), resolve=True
++    )
++    meta["empty_label"] = int(ds_cfg.get("empty_label", 0))
++    meta["ignore_index"] = int(ds_cfg.get("ignore_index", 255))
++
++    # pass pseudo config through to LitModule
++    if "pseudo" in cfg:
++        meta["pseudo"] = cfg.pseudo
++
++    # pass render2d config through to LitModule
++    if "render2d" in cfg:
++        meta["render2d"] = cfg.render2d
++
++    if "teacher" in cfg:
++        meta["teacher"] = cfg.teacher
++
++    if _get_cil_mode(ds_cfg) == "disjoint" and meta["continual_splits"] is not None:
++        base, new, old, novel, future, seen = _get_base_new_old_novel_future(
++            meta["continual_splits"], meta["continual_step"]
++        )
++        meta["base_global_classes"] = base
++        meta["new_global_classes"] = new
++        meta["old_global_classes"] = old
++        meta["novel_global_classes"] = novel
++        meta["future_global_classes"] = future
++        meta["seen_global_classes"] = seen
++    else:
++        meta["base_global_classes"] = None
++        meta["new_global_classes"] = None
++        meta["old_global_classes"] = None
++        meta["novel_global_classes"] = None
++        meta["future_global_classes"] = None
++        meta["seen_global_classes"] = None
++
++    if ds_train is not None and hasattr(ds_train, "num_classes"):
++        meta["num_classes"] = int(ds_train.num_classes)
++
++    if "class_weights" in meta:
++        full_w = meta["class_weights"]
++        if not torch.is_tensor(full_w):
++            full_w = torch.tensor(full_w)
++        full_w = full_w.float()
++    else:
++        freq = meta["class_frequencies"]
++        if not torch.is_tensor(freq):
++            freq = torch.tensor(freq)
++        full_w = (1.0 / torch.log(freq.float() + 1e-6)).float()
++        meta["class_weights"] = full_w
++
++    num_cls, cil_w, cur, seen = compute_disjoint_num_classes_and_weights(ds_cfg, full_w)
++    meta["num_classes"] = num_cls
++    new_class_boost = float(getattr(ds_cfg, 'cil_new_class_weight_boost', 1.0))
++    if new_class_boost != 1.0 and cur is not None and seen is not None:
++        old_len = len(seen) - len(cur)
++        if old_len > 0:
++            cil_w = cil_w.clone()
++            cil_w[1 + old_len:] *= new_class_boost
++    meta["cil_class_weights"] = cil_w
++    meta["cur_global_classes"] = cur
++    meta["seen_global_classes"] = seen if seen is not None else meta.get("seen_global_classes", None)
++
++    sys.stderr.write(f"[META DEBUG] num_classes={meta['num_classes']}\n")
++    sys.stderr.write(f"[META DEBUG] cur_global_classes={meta.get('cur_global_classes', None)}\n")
++    sys.stderr.write(f"[META DEBUG] seen_global_classes={meta.get('seen_global_classes', None)}\n")
++    sys.stderr.write(f"[META DEBUG] old_global_classes={meta.get('old_global_classes', None)}\n")
++    sys.stderr.write(f"[META DEBUG] new_global_classes={meta.get('new_global_classes', None)}\n")
++
++    if "pseudo" in meta:
++        sys.stderr.write(f"[META DEBUG] pseudo={meta['pseudo']}\n")
++
++    if "render2d" in meta:
++        sys.stderr.write(f"[META DEBUG] render2d={meta['render2d']}\n")
++
++    sys.stderr.flush()
+ 
+-    return [
+-        DataLoader(
+-            build_from_configs(datasets, dict(**cfg.datasets, **cfgs)),
+-            **cfg.loader,
+-            shuffle=split == 'train') for split, cfgs in split_cfgs.items()
+-    ], getattr(datasets, cfg.datasets.type).META_INFO
++    return loaders, meta
+\ No newline at end of file

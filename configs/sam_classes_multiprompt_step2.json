@@ -1,0 +1,5 @@
+{
+  "car": {"compact_id": 8, "prompts": ["car", "sedan", "van"]},
+  "person": {"compact_id": 9, "prompts": ["person", "pedestrian"]},
+  "traffic-sign": {"compact_id": 10, "prompts": ["traffic-sign", "road-sign"]}
+}

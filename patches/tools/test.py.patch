@@ -1,0 +1,394 @@
+--- a/tools/test.py
++++ b/tools/test.py
+@@ -1,5 +1,7 @@
+ import os
+ import os.path as osp
++import time
++import copy
+ 
+ import hydra
+ import numpy as np
+@@ -8,74 +10,332 @@
+ from rich.progress import track
+ 
+ from ssc_ia import LitModule, build_data_loaders, pre_build_callbacks
++from ssc_ia.evaluation.ssc_metric import SSCMetrics
++
+ 
+ KITTI_LABEL_MAP = {
+-    0: 0,  # unlabeled
+-    1: 10,  # car
+-    2: 11,  # bicycle
+-    3: 15,  # motorcycle
+-    4: 18,  # truck
+-    5: 20,  # other-vehicle
+-    6: 30,  # person
+-    7: 31,  # bicyclist
+-    8: 32,  # motorcyclist
+-    9: 40,  # road
+-    10: 44,  # parking
+-    11: 48,  # sidewalk
+-    12: 49,  # other-ground
+-    13: 50,  # building
+-    14: 51,  # fence
+-    15: 70,  # vegetation
+-    16: 71,  # trunk
+-    17: 72,  # terrain
+-    18: 80,  # pole
+-    19: 81,  # traffic-sign
++    0: 0, 1: 10, 2: 11, 3: 15, 4: 18, 5: 20,
++    6: 30, 7: 31, 8: 32, 9: 40, 10: 44,
++    11: 48, 12: 49, 13: 50, 14: 51,
++    15: 70, 16: 71, 17: 72, 18: 80, 19: 81,
+ }
+ 
+-outputs_dir = '/mnt/A/hust_ley/CODE_LEY/Project/iascene_pro/IAScene-Outputs/'
+-unique_id = 'e14-17.04-0108-reSet'
++OUTPUTS_DIR = "eval_outputs"
++UNIQUE_ID = time.strftime("%Y%m%d-%H%M%S")
++
++
++def to_cpu_recursive(x):
++    if torch.is_tensor(x):
++        return x.detach().cpu()
++    if isinstance(x, dict):
++        return {k: to_cpu_recursive(v) for k, v in x.items()}
++    if isinstance(x, (list, tuple)):
++        t = [to_cpu_recursive(v) for v in x]
++        return type(x)(t) if isinstance(x, tuple) else t
++    return x
++
++
++def compact_pred_to_global(pred_compact, meta_info):
++    """
++    pred_compact: numpy array [L, W, H] with compact seen-space ids
++    returns:     numpy array [L, W, H] with global SemanticKITTI ids
++    """
++    pred_global = np.zeros_like(pred_compact, dtype=np.int32)
++
++    seen = meta_info.get("seen_global_classes", None)
++    if seen is None:
++        raise ValueError("meta_info['seen_global_classes'] is missing")
++
++    for compact_id, global_id in enumerate(seen, start=1):
++        pred_global[pred_compact == compact_id] = global_id
++
++    return pred_global
++
++
++def expand_teacher_compact_to_global(logits_compact, old_global_classes, empty_label=0):
++    """
++    Teacher is step-0 old-class model:
++      compact channel 0 = background
++      compact channel 1..K = old_global_classes in sorted order
+ 
+-@hydra.main(config_path='../configs', config_name='my_config_sema', version_base=None)
++    logits_compact: [B, Cc, L, W, H]
++    returns logits_global: [B, 20, L, W, H]
++    """
++    B, Cc, L, W, H = logits_compact.shape
++    num_global = 20
++
++    logits_global = torch.zeros(
++        B, num_global, L, W, H,
++        device=logits_compact.device,
++        dtype=logits_compact.dtype
++    )
++
++    logits_global[:, empty_label] = logits_compact[:, 0]
++
++    old_sorted = sorted(list(old_global_classes))
++    expected = 1 + len(old_sorted)
++    if Cc != expected:
++        raise ValueError(
++            f"Teacher compact logits have C={Cc}, expected {expected} "
++            f"(bg + {len(old_sorted)} old classes)"
++        )
++
++    for j, g in enumerate(old_sorted, start=1):
++        logits_global[:, g] = logits_compact[:, j]
++
++    return logits_global
++
++
++def _get_cfg_value(cfg: DictConfig, key: str, default=None):
++    try:
++        return OmegaConf.select(cfg, key, default=default)
++    except Exception:
++        return default
++
++
++@hydra.main(config_path="../configs", config_name="config_sema", version_base=None)
+ def main(cfg: DictConfig):
+-    if os.environ.get('LOCAL_RANK', 0) == 0:
++    if os.environ.get("LOCAL_RANK", "0") == "0":
+         print(OmegaConf.to_yaml(cfg))
+-    cfg, _ = pre_build_callbacks(cfg)
+ 
+-    dls, meta_info = build_data_loaders(cfg.data)
+-    data_loader = dls[-1]
+-    output_dir = osp.join(outputs_dir, cfg.data.datasets.type, unique_id)
++    cfg, _ = pre_build_callbacks(cfg)
++    # Forward root-level pseudo config into cfg.data so build_data_loaders
++    # can pass it to the dataset constructor (same fix as train.py).
++    _data_cfg = cfg.data.copy()
++    OmegaConf.set_struct(_data_cfg, False)
++    if "pseudo" in cfg:
++        _data_cfg.pseudo = cfg.pseudo
++    dls, meta_info = build_data_loaders(_data_cfg)
++
++    # validation loader
++    data_loader = dls[-2]
++
++    # -------- REQUIRED META FOR IAScene ----------
++    train_num_classes = int(meta_info["num_classes"])
++    class_frequencies = meta_info["class_frequencies"]
++    bk_cls_info = meta_info["bk_cls_info"]
++    ins_cls_info = meta_info["ins_cls_info"]
++
++    print("\n========== META INFO ==========")
++    print("Train/Eval num_classes:", train_num_classes)
++    print("Seen global classes:", meta_info.get("seen_global_classes"))
++    print("Current global classes:", meta_info.get("cur_global_classes"))
++    print("Old global classes:", meta_info.get("old_global_classes"))
++    print("================================\n")
++
++    assert cfg.resume.ckpt_path is not None, "You must provide resume.ckpt_path"
++
++    # -------------------------
++    # Load STUDENT (current ckpt)
++    # -------------------------
++    meta_info.pop("pseudo", None)  # already in **cfg; remove to avoid duplicate kwarg
++    model = LitModule(
++        **cfg,
++        **meta_info
++    )
++
++    ckpt = torch.load(cfg.resume.ckpt_path, map_location="cpu")
++    state_dict = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
++    missing, unexpected = model.load_state_dict(state_dict, strict=False)
++
++    print("\n========== STUDENT WEIGHTS-ONLY LOAD ==========")
++    print("Checkpoint:", cfg.resume.ckpt_path)
++    print("Missing keys:", missing)
++    print("Unexpected keys:", unexpected)
++    print("===============================================\n")
+ 
+-    if cfg.get('ckpt_path'):
+-        model = LitModule.load_from_checkpoint(cfg.ckpt_path, **cfg, meta_info=meta_info)
+-    else:
+-        import warnings
+-        warnings.warn('\033[31;1m{}\033[0m'.format('No checkpoint path is provided'))
+-        model = LitModule(**cfg, meta_info=meta_info)
+     model.cuda()
+     model.eval()
+ 
+-    assert cfg.data.datasets.type == 'SemanticKITTI'
++    # -------------------------
++    # Optional teacher for debug dumps
++    # -------------------------
++    dump_teacher_old = bool(_get_cfg_value(cfg, "dump_teacher_old", False))
++    teacher_ckpt_path = _get_cfg_value(cfg, "teacher.ckpt_path", None)
++    taus = _get_cfg_value(cfg, "teacher.taus", [0.6, 0.7, 0.8, 0.9, 0.95])
++
++    teacher = None
++    old_global_classes = meta_info.get("old_global_classes", None)
++
++    if dump_teacher_old:
++        assert teacher_ckpt_path is not None, (
++            "dump_teacher_old=True but cfg.teacher.ckpt_path is not set.\n"
++            "Add to your hydra config:\n"
++            "teacher:\n"
++            "  ckpt_path: /path/to/step0.ckpt\n"
++        )
++        assert old_global_classes is not None and len(old_global_classes) > 0, (
++            "meta_info.old_global_classes is missing/empty."
++        )
++
++        teacher_meta = copy.deepcopy(meta_info)
++        teacher_meta["num_classes"] = 1 + len(sorted(old_global_classes))
++        teacher_meta["cur_global_classes"] = sorted(old_global_classes)
++        teacher_meta["seen_global_classes"] = sorted(old_global_classes)
++
++        teacher = LitModule(
++            **cfg,
++            **teacher_meta
++        )
++        t_ckpt = torch.load(teacher_ckpt_path, map_location="cpu")
++        t_state = t_ckpt["state_dict"] if "state_dict" in t_ckpt else t_ckpt
++        t_missing, t_unexpected = teacher.load_state_dict(t_state, strict=False)
++
++        print("\n========== TEACHER WEIGHTS-ONLY LOAD ==========")
++        print("Teacher checkpoint:", teacher_ckpt_path)
++        print("Teacher missing keys:", t_missing)
++        print("Teacher unexpected keys:", t_unexpected)
++        print("Teacher old_global_classes:", sorted(old_global_classes))
++        print("Teacher taus:", taus)
++        print("===============================================\n")
++
++        teacher.cuda()
++        teacher.eval()
++        for p in teacher.parameters():
++            p.requires_grad_(False)
++
++    # -------------------------
++    # Output dirs
++    # -------------------------
++    output_dir = osp.join(OUTPUTS_DIR, cfg.data.datasets.type, UNIQUE_ID)
++    os.makedirs(output_dir, exist_ok=True)
++
+     label_map = np.array([KITTI_LABEL_MAP[i] for i in range(len(KITTI_LABEL_MAP))], dtype=np.int32)
+ 
++    evaluator = SSCMetrics(
++        num_classes=train_num_classes,
++        ignore_index=meta_info["ignore_index"],
++        meta_info=meta_info
++    )
++    evaluator.reset()
++
++    n_batches = 0
++
+     with torch.no_grad():
+-        for batch_inputs, targets in track(data_loader):
+-            for key in batch_inputs:
+-                if isinstance(batch_inputs[key], torch.Tensor):
+-                    batch_inputs[key] = batch_inputs[key].cuda()
++        for batch_inputs, targets in track(data_loader, description="Evaluating"):
++            n_batches += 1
+ 
++            if n_batches == 1:
++                print("\n========== BATCH INPUT KEYS ==========")
++                print(batch_inputs.keys())
++                print("======================================\n")
++
++            for k, v in batch_inputs.items():
++                if torch.is_tensor(v):
++                    batch_inputs[k] = v.cuda(non_blocking=True)
++
++            # -------------------------
++            # Student forward
++            # -------------------------
+             outputs = model(batch_inputs)
+-            preds = torch.softmax(outputs['ssc_logits'][-1], dim=1).detach().cpu().numpy()
+-            preds = np.argmax(preds, axis=1)
+ 
+-            for i in range(preds.shape[0]):
+-                pred = label_map[preds[i].reshape(-1)].astype(np.uint16)
+-                save_dir = osp.join(output_dir,
+-                                    f"test/sequences/{batch_inputs['sequence'][i]}/predictions")
+-                file_path = osp.join(save_dir, f"{batch_inputs['frame_id'][i]}.label")
++            ssc_logits = outputs["ssc_logits"]
++            if isinstance(ssc_logits, (list, tuple)):
++                ssc_logits = ssc_logits[-1]
++
++            # KEEP STUDENT LOGITS IN COMPACT SPACE
++            pred_logits_cpu = ssc_logits.detach().cpu()
++            targets_cpu = to_cpu_recursive(targets)
++
++            evaluator.update({"ssc_logits": pred_logits_cpu}, targets_cpu)
++
++            # compact prediction ids [0..11]
++            pred_cls_compact = torch.argmax(pred_logits_cpu, dim=1).numpy()  # (B, L, W, H)
++
++            # -------------------------
++            # Optional teacher forward for old-class debug dumps
++            # -------------------------
++            teacher_conf_old = None
++            teacher_pred_old = None
++
++            if dump_teacher_old and teacher is not None:
++                t_out = teacher(batch_inputs)
++                t_logits = t_out["ssc_logits"]
++                if isinstance(t_logits, (list, tuple)):
++                    t_logits = t_logits[-1]
++
++                t_logits = expand_teacher_compact_to_global(
++                    t_logits,
++                    old_global_classes=old_global_classes,
++                    empty_label=meta_info["empty_label"]
++                )
++
++                t_prob = torch.softmax(t_logits, dim=1)  # [B, 20, L, W, H]
++
++                old_ids = torch.tensor(
++                    list(sorted(old_global_classes)),
++                    device=t_prob.device,
++                    dtype=torch.long
++                )
++                t_prob_old = torch.index_select(t_prob, dim=1, index=old_ids)  # [B, Cold, L, W, H]
++
++                teacher_conf_old, idx = torch.max(t_prob_old, dim=1)  # [B, L, W, H]
++                teacher_pred_old = old_ids[idx]  # [B, L, W, H] global ids
++
++            # -------------------------
++            # Save files per sample
++            # -------------------------
++            for i in range(pred_cls_compact.shape[0]):
++                pred_global = compact_pred_to_global(pred_cls_compact[i], meta_info)
++                pred_mapped = label_map[pred_global.reshape(-1)].astype(np.uint16)
++
++                save_dir = osp.join(
++                    output_dir,
++                    f"test/sequences/{batch_inputs['sequence'][i]}/predictions"
++                )
+                 os.makedirs(save_dir, exist_ok=True)
+-                pred.tofile(file_path)
+-                print('saved to', file_path)
++
++                frame_id = batch_inputs["frame_id"][i]
++
++                # ---- SAVE .label FILE ----
++                file_path = osp.join(save_dir, f"{frame_id}.label")
++                pred_mapped.tofile(file_path)
++
++                # ---- SAVE teacher debug dump ----
++                if dump_teacher_old and teacher_conf_old is not None and teacher_pred_old is not None:
++                    npz_path = osp.join(save_dir, f"{frame_id}.teacher_old.npz")
++
++                    save_kwargs = {
++                        "teacher_conf_old": teacher_conf_old[i].detach().cpu().numpy().astype(np.float16),
++                        "teacher_pred_old": teacher_pred_old[i].detach().cpu().numpy().astype(np.uint8),
++                    }
++
++                    if "cam_pose" in batch_inputs and torch.is_tensor(batch_inputs["cam_pose"]):
++                        save_kwargs["cam_pose"] = batch_inputs["cam_pose"][i].detach().cpu().numpy().astype(np.float32)
++
++                    if "voxel_origin" in batch_inputs and torch.is_tensor(batch_inputs["voxel_origin"]):
++                        save_kwargs["voxel_origin"] = batch_inputs["voxel_origin"][i].detach().cpu().numpy().astype(np.float32)
++
++                    if "fov_mask_1" in batch_inputs and torch.is_tensor(batch_inputs["fov_mask_1"]):
++                        save_kwargs["fov_mask_1"] = batch_inputs["fov_mask_1"][i].detach().cpu().numpy().astype(bool)
++
++                    np.savez_compressed(npz_path, **save_kwargs)
++
++                    if (n_batches % 50) == 0 and i == 0:
++                        conf_i = teacher_conf_old[i]
++                        covs = []
++                        for tau in taus:
++                            covs.append(float((conf_i > float(tau)).float().mean().item()))
++                        print(f"[Teacher τ coverage] batch={n_batches} frame={frame_id} cov={covs} taus={taus}")
++
++    print("\n✅ Finished iterating over dataloader.")
++    print(f"Output folder: {output_dir}")
++    print(f"Batches processed: {n_batches}")
++
++    print("\n========== FINAL TEST METRICS ==========")
++    results = evaluator.compute()
++
++    if isinstance(results, dict):
++        for k, v in results.items():
++            print(f"{k}: {v}")
++    else:
++        print(results)
++
++    print("========================================\n")
++
++    if dump_teacher_old:
++        print("\n✅ Teacher debug dumps saved as: *.teacher_old.npz next to *.label files.\n")
+ 
+ 
+-if __name__ == '__main__':
+-    main()
++if __name__ == "__main__":
++    main()
+\ No newline at end of file

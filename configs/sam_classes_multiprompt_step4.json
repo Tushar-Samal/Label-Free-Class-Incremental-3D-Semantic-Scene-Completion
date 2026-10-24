@@ -1,0 +1,6 @@
+{
+  "bicycle": {"compact_id": 14, "prompts": ["bicycle", "bike"]},
+  "motorcycle": {"compact_id": 15, "prompts": ["motorcycle", "scooter", "motorbike"]},
+  "bicyclist": {"compact_id": 16, "prompts": ["bicyclist", "cyclist", "bicycle rider", "person on a bike", "person riding a bicycle"]},
+  "motorcyclist": {"compact_id": 17, "prompts": ["motorcyclist", "motorcycle rider", "person riding a motorcycle", "person on a motorcycle"]}
+}

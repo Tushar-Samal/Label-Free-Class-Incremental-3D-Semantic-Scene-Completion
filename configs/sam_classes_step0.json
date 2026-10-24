@@ -1,0 +1,6 @@
+{
+  "road": 1,
+  "sidewalk": 2,
+  "vegetation": 3,
+  "terrain": 4
+}

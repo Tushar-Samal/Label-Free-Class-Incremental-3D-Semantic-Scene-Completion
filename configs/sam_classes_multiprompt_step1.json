@@ -1,0 +1,5 @@
+{
+  "fence": {"compact_id": 5, "prompts": ["fence"]},
+  "trunk": {"compact_id": 6, "prompts": ["tree-trunk"]},
+  "pole": {"compact_id": 7, "prompts": ["pole"]}
+}
